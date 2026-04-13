@@ -1,6 +1,6 @@
 {
   "name": "@ranklancer/uptime-kuma-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MCP server for Uptime Kuma — monitor management, heartbeats, status pages, and notifications for AI assistants",
   "mcpName": "io.github.ranklancer/uptime-kuma-mcp",
   "private": false,
