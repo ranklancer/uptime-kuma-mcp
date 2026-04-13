@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+*.env.local
+secrets/
+.git/
+.gitignore
+.vscode/
+.idea/
+*.md
+docker-compose*.yml
+LICENSE
+server.json

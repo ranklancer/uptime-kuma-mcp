@@ -1,0 +1,71 @@
+# Example Docker Compose for uptime-kuma-mcp
+#
+# Copy to docker-compose.yml, create a .env from .env.example,
+# and create secrets files (or use env vars directly).
+
+services:
+  uptime-kuma-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: uptime-kuma-mcp
+    # --- If using Docker secrets for passwords: ---
+    entrypoint:
+      - sh
+      - -c
+      - |
+        export KUMA_PASSWORD=$$(cat /run/secrets/kuma_password)
+        # Uncomment for additional instances:
+        # export SECONDARY_PASSWORD=$$(cat /run/secrets/secondary_password)
+        exec node dist/index.js
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      TZ: ${TZ:-UTC}
+      KUMA_INSTANCES: ${KUMA_INSTANCES:-kuma}
+      KUMA_BASE_URL: ${KUMA_BASE_URL}
+      KUMA_USERNAME: ${KUMA_USERNAME}
+      # Uncomment for additional instances:
+      # SECONDARY_BASE_URL: ${SECONDARY_BASE_URL}
+      # SECONDARY_USERNAME: ${SECONDARY_USERNAME}
+      # SECONDARY_INSECURE_TLS: "true"
+    secrets:
+      - kuma_password
+      # - secondary_password
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # No cap_add needed — pure Node.js, no special privileges required
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid
+    mem_limit: 256m
+    cpus: 0.3
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - kuma-mcp
+
+secrets:
+  kuma_password:
+    file: ./secrets/kuma_password
+  # secondary_password:
+  #   file: ./secrets/secondary_password
+
+networks:
+  kuma-mcp:
+    driver: bridge

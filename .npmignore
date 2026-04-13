@@ -1,0 +1,11 @@
+src/
+tsconfig.json
+Dockerfile
+docker-compose*.yml
+.dockerignore
+.env.example
+secrets/
+.git/
+.github/
+server.json
+*.log

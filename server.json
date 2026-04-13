@@ -1,0 +1,51 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ranklancer/uptime-kuma-mcp",
+  "title": "Uptime Kuma MCP Server",
+  "description": "MCP server for Uptime Kuma — monitor uptime, manage monitors, heartbeats, notifications, and status pages",
+  "repository": {
+    "url": "https://github.com/ranklancer/uptime-kuma-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@ranklancer/uptime-kuma-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "KUMA_INSTANCES",
+          "description": "Comma-separated list of instance names (e.g. 'kuma' or 'primary,secondary')",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "KUMA_BASE_URL",
+          "description": "Base URL of your Uptime Kuma instance (e.g. 'http://192.0.2.1:3001')",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "KUMA_USERNAME",
+          "description": "Uptime Kuma login username",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "KUMA_PASSWORD",
+          "description": "Uptime Kuma login password",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
