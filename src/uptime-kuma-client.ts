@@ -8,9 +8,18 @@ export class UptimeKumaClient {
   private session: KumaSession | null = null;
   private connected = false;
 
+  /**
+   * Cached monitor list. Uptime Kuma pushes the full list via the
+   * 'monitorList' Socket.IO event after login. We store it here
+   * and keep it updated as the server pushes changes.
+   */
+  private monitorCache: Record<string, any> = {};
+  private monitorCacheReady = false;
+  private monitorCacheWaiters: Array<() => void> = [];
+
   constructor(private cfg: KumaInstanceConfig) {}
 
-  // ── Connection management ───────────────────────────────────────
+  // ── Connection management ───────────────────────────────────
 
   /** Ensure the Socket.IO connection is established and authenticated. */
   private async ensureConnected(): Promise<Socket> {
@@ -32,6 +41,10 @@ export class UptimeKumaClient {
       try { this.socket.disconnect(); } catch { /* swallow */ }
     }
 
+    // Reset cache state on new connection
+    this.monitorCache = {};
+    this.monitorCacheReady = false;
+
     this.socket = io(this.cfg.baseUrl, {
       path: '/socket.io',
       transports: ['websocket'],
@@ -40,6 +53,18 @@ export class UptimeKumaClient {
       reconnectionDelay: 1000,
       timeout: 10_000,
       rejectUnauthorized: !this.cfg.insecureTLS,
+    });
+
+    // Listen for monitor list pushes from Uptime Kuma.
+    // This event fires after login and on every monitor change.
+    this.socket.on('monitorList', (data: Record<string, any>) => {
+      this.monitorCache = data;
+      if (!this.monitorCacheReady) {
+        this.monitorCacheReady = true;
+        // Wake up anyone waiting for the initial list
+        for (const resolve of this.monitorCacheWaiters) resolve();
+        this.monitorCacheWaiters = [];
+      }
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -111,6 +136,23 @@ export class UptimeKumaClient {
     });
   }
 
+  /**
+   * Wait until the monitor list has been pushed at least once.
+   * Uptime Kuma sends 'monitorList' shortly after login.
+   */
+  private async waitForMonitorCache(timeoutMs = 15_000): Promise<void> {
+    if (this.monitorCacheReady) return;
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`[${this.cfg.name}] timeout waiting for monitorList event`));
+      }, timeoutMs);
+      this.monitorCacheWaiters.push(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
   /** Disconnect the Socket.IO client gracefully. */
   async disconnect(): Promise<void> {
     if (this.socket) {
@@ -119,15 +161,17 @@ export class UptimeKumaClient {
     }
     this.connected = false;
     this.session = null;
+    this.monitorCache = {};
+    this.monitorCacheReady = false;
   }
 
-  // ── Read operations ─────────────────────────────────────────────
+  // ── Read operations ─────────────────────────────────────────
 
-  /** List all monitors. */
+  /** List all monitors from the cached monitorList event data. */
   async listMonitors(): Promise<Record<string, any>> {
     await this.ensureConnected();
-    const res = await this.emitWithAck('getMonitorList');
-    return res;
+    await this.waitForMonitorCache();
+    return this.monitorCache;
   }
 
   /** Get a single monitor by ID with recent heartbeats. */
@@ -172,7 +216,7 @@ export class UptimeKumaClient {
     return res;
   }
 
-  // ── Write operations ────────────────────────────────────────────
+  // ── Write operations ────────────────────────────────────────
 
   /** Add a new monitor. */
   async addMonitor(opts: MonitorOpts): Promise<any> {
