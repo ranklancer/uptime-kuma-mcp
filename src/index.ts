@@ -78,6 +78,16 @@ interface McpSession {
 }
 
 const sessions = new Map<string, McpSession>();
+const closingSessions = new Set<string>();
+
+function cleanupSession(sessionId: string): void {
+  if (!sessionId || closingSessions.has(sessionId)) return;
+  closingSessions.add(sessionId);
+  sessions.delete(sessionId);
+  // Don't call server.close() here — it triggers transport.onclose
+  // which would recurse back into this function.
+  closingSessions.delete(sessionId);
+}
 
 // ── HTTP server ─────────────────────────────────────────────────────
 
@@ -85,7 +95,12 @@ const httpServer = http.createServer(async (req, res) => {
   // Health check
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'uptime-kuma-mcp', version: '0.1.0' }));
+    res.end(JSON.stringify({
+      ok: true,
+      service: 'uptime-kuma-mcp',
+      version: '0.1.0',
+      activeSessions: sessions.size,
+    }));
     return;
   }
 
@@ -124,11 +139,10 @@ const httpServer = http.createServer(async (req, res) => {
   const server = createMcpServer();
   await server.connect(transport);
 
-  // Clean up when the session closes
+  // Clean up when the session closes (just remove from map, no recursive close)
   transport.onclose = () => {
     const sid = (transport as any).sessionId ?? (transport as any)._sessionId;
-    if (sid) sessions.delete(sid);
-    server.close().catch(() => {});
+    if (sid) cleanupSession(sid);
   };
 
   // Handle the initialize request
@@ -147,11 +161,13 @@ httpServer.listen(PORT, HOST, () => {
 });
 
 async function shutdown() {
-  // Close all active sessions
-  for (const [, session] of sessions) {
+  // Close all active sessions gracefully
+  for (const [sid, session] of sessions) {
+    closingSessions.add(sid);
     await session.server.close().catch(() => {});
   }
   sessions.clear();
+  closingSessions.clear();
   await disconnectAll();
   httpServer.close();
   process.exit(0);
