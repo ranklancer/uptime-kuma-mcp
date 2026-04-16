@@ -97,14 +97,19 @@ export const toolDefs: ToolDef[] = [
       'Get an overall uptime statistics summary: total monitors, up/down/paused counts, and average uptime.',
     schema: z.object({ instance: Instance }),
     handler: async (args) => {
-      const monitors = await getClient(args.instance).listMonitors();
+      const client = getClient(args.instance);
+      const monitors = await client.listMonitors();
       const list = Object.values(monitors);
+      const heartbeatStatuses = client.getHeartbeatStatuses();
 
       let up = 0, down = 0, paused = 0, maintenance = 0;
       for (const m of list as any[]) {
         if (!m.active) { paused++; continue; }
-        // Status comes from heartbeat data; we count active monitors
-        up++; // Default to counting active as "up" — status refined by heartbeats
+
+        const hbStatus = heartbeatStatuses.get(m.id);
+        if (hbStatus === 0)      { down++; }
+        else if (hbStatus === 3) { maintenance++; }
+        else                     { up++; } // 1 (UP), 2 (PENDING), or no heartbeat yet
       }
 
       return {
@@ -203,6 +208,7 @@ export const toolDefs: ToolDef[] = [
       accepted_statuscodes: z.string().optional().describe('New accepted HTTP status codes'),
       ignoreTls:          z.boolean().optional().describe('Ignore TLS errors'),
       description:        z.string().optional().describe('New description'),
+      parent:             z.number().int().nullable().optional().describe('Parent group monitor ID (null to move to root)'),
     }),
     handler: async (args) => {
       const { instance, monitorId, ...opts } = args;

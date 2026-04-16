@@ -17,6 +17,14 @@ export class UptimeKumaClient {
   private monitorCacheReady = false;
   private monitorCacheWaiters: Array<() => void> = [];
 
+  /**
+   * Cached latest heartbeat status per monitor ID.
+   * Populated by the 'heartbeat' Socket.IO event that Uptime Kuma
+   * pushes continuously after login.
+   * Values: 0 = DOWN, 1 = UP, 2 = PENDING, 3 = MAINTENANCE
+   */
+  private heartbeatStatusCache: Map<number, number> = new Map();
+
   constructor(private cfg: KumaInstanceConfig) {}
 
   // ── Connection management ───────────────────────────────────
@@ -44,6 +52,7 @@ export class UptimeKumaClient {
     // Reset cache state on new connection
     this.monitorCache = {};
     this.monitorCacheReady = false;
+    this.heartbeatStatusCache.clear();
 
     this.socket = io(this.cfg.baseUrl, {
       path: '/socket.io',
@@ -64,6 +73,25 @@ export class UptimeKumaClient {
         // Wake up anyone waiting for the initial list
         for (const resolve of this.monitorCacheWaiters) resolve();
         this.monitorCacheWaiters = [];
+      }
+    });
+
+    // Listen for real-time heartbeat events to track monitor status.
+    // Uptime Kuma pushes these continuously after login for every check.
+    this.socket.on('heartbeat', (heartbeat: any) => {
+      if (heartbeat && typeof heartbeat.monitorID === 'number' && typeof heartbeat.status === 'number') {
+        this.heartbeatStatusCache.set(heartbeat.monitorID, heartbeat.status);
+      }
+    });
+
+    // Seed heartbeat status cache from initial heartbeat list push.
+    // Uptime Kuma sends 'heartbeatList' per monitor with recent beats after login.
+    this.socket.on('heartbeatList', (monitorId: number, beats: any[]) => {
+      if (Array.isArray(beats) && beats.length > 0) {
+        const latest = beats[beats.length - 1];
+        if (latest && typeof latest.status === 'number') {
+          this.heartbeatStatusCache.set(monitorId, latest.status);
+        }
       }
     });
 
@@ -163,6 +191,7 @@ export class UptimeKumaClient {
     this.session = null;
     this.monitorCache = {};
     this.monitorCacheReady = false;
+    this.heartbeatStatusCache.clear();
   }
 
   // ── Read operations ─────────────────────────────────────────
@@ -172,6 +201,14 @@ export class UptimeKumaClient {
     await this.ensureConnected();
     await this.waitForMonitorCache();
     return this.monitorCache;
+  }
+
+  /**
+   * Get the latest heartbeat status for each monitor.
+   * Returns a Map of monitorId → status (0=DOWN, 1=UP, 2=PENDING, 3=MAINTENANCE).
+   */
+  getHeartbeatStatuses(): Map<number, number> {
+    return this.heartbeatStatusCache;
   }
 
   /** Get a single monitor by ID with recent heartbeats. */
