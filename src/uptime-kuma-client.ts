@@ -3,6 +3,80 @@ import type { KumaInstanceConfig, KumaSession, MonitorOpts } from './types.js';
 
 const TOKEN_TTL_MS = 48 * 60 * 60 * 1000; // re-auth every 48h to be safe
 
+const REDACTED = '***REDACTED***';
+
+/**
+ * True if a notification-config field NAME implies it holds a secret.
+ * Covers *token / *password / *secret / *key suffixes, common secret words,
+ * and auth-header fields (which routinely embed bearer tokens).
+ */
+function isSecretFieldName(name: string): boolean {
+  const n = name.toLowerCase();
+  if (/header/.test(n)) return true; // e.g. webhookAdditionalHeaders -> bearer/token
+  if (/(token|password|passwd|pwd|secret|apikey|api_key|accesskey|access_key|privatekey|private_key|credential|signingkey|appkey|authkey)/.test(n)) return true;
+  if (/key$/.test(n)) return true;   // *key
+  return false;
+}
+
+/** True if a string is a URL that embeds credentials (userinfo or secret query param). */
+function urlEmbedsCreds(val: unknown): boolean {
+  if (typeof val !== 'string') return false;
+  // scheme://user:pass@host
+  if (/:\/\/[^/@\s]+:[^/@\s]+@/.test(val)) return true;
+  // credential-bearing query params
+  if (/[?&](?:token|access_token|api_?key|key|secret|password|passwd|auth|sig|signature|tk)=/i.test(val)) return true;
+  return false;
+}
+
+/** Recursively mask secret-bearing values in a parsed notification config object. */
+function redactConfigObject(obj: any): any {
+  if (Array.isArray(obj)) return obj.map(redactConfigObject);
+  if (obj && typeof obj === 'object') {
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (v && typeof v === 'object') {
+        out[k] = redactConfigObject(v);
+      } else if (isSecretFieldName(k) && v !== undefined && v !== null && v !== '') {
+        out[k] = REDACTED;                       // keep field name, mask value
+      } else if (/url|uri/i.test(k) && urlEmbedsCreds(v)) {
+        out[k] = REDACTED;                       // credential-bearing URL
+      } else if (typeof v === 'string' && /^[a-z]+:\/\//i.test(v) && urlEmbedsCreds(v)) {
+        out[k] = REDACTED;                       // value is a URL embedding creds
+      } else {
+        out[k] = v;
+      }
+    }
+    return out;
+  }
+  return obj;
+}
+
+/**
+ * Return a copy of a notification-provider record with secrets in its `config`
+ * masked. Read paths use this so callers can see that a provider *has* a token
+ * (field name preserved) without seeing the value. The cache itself is never
+ * mutated — internal merge paths (getNotification) read the raw values.
+ *
+ * `config` may be a JSON string (Uptime Kuma's wire format) or an object,
+ * depending on version; both are handled. If a string config can't be parsed,
+ * it is fully redacted rather than risk leaking.
+ */
+function redactNotificationProvider(provider: any): any {
+  if (!provider || typeof provider !== 'object') return provider;
+  const raw = provider.config;
+  let redactedConfig: any = raw;
+  if (typeof raw === 'string') {
+    try {
+      redactedConfig = JSON.stringify(redactConfigObject(JSON.parse(raw)));
+    } catch {
+      redactedConfig = REDACTED;
+    }
+  } else if (raw && typeof raw === 'object') {
+    redactedConfig = redactConfigObject(raw);
+  }
+  return { ...provider, config: redactedConfig };
+}
+
 export class UptimeKumaClient {
   private socket: Socket | null = null;
   private session: KumaSession | null = null;
@@ -278,14 +352,26 @@ export class UptimeKumaClient {
    * NOTE: previously this used emitWithAck('getNotificationList'), which has no
    * server-side ack handler and therefore always timed out. The cache approach
    * is reliable and returns instantly once the post-login push has arrived.
+   *
+   * SECRETS: provider `config` blobs hold live secrets (access tokens, webhook
+   * auth headers, etc.). This read path masks them via redactNotificationProvider
+   * so callers never receive raw secret values. The cache is left untouched.
    */
   async listNotifications(): Promise<any[]> {
     await this.ensureConnected();
     await this.waitForNotificationCache();
-    return this.notificationCache;
+    return this.notificationCache.map(redactNotificationProvider);
   }
 
-  /** Return a single cached notification provider by ID, or undefined. */
+  /**
+   * Return a single cached notification provider by ID, or undefined.
+   *
+   * INTERNAL / RAW: this intentionally returns the UNREDACTED provider because
+   * it is used by update_notification to fetch-merge-save the existing config —
+   * masking here would write '***REDACTED***' back over real secrets. It is not
+   * exposed as a read tool. Read-facing output must go through listNotifications
+   * (or redactNotificationProvider) instead.
+   */
   async getNotification(notificationId: number): Promise<any | undefined> {
     await this.ensureConnected();
     await this.waitForNotificationCache();
