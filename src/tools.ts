@@ -180,14 +180,21 @@ export const toolDefs: ToolDef[] = [
       description:        z.string().optional().describe('Monitor description'),
       dns_resolve_type:   z.string().optional().describe('DNS record type (A, AAAA, MX, etc.)'),
       dns_resolve_server: z.string().optional().describe('DNS server to use for resolution'),
+      notificationIds:    z.array(z.number().int()).optional().describe('Notification provider IDs to attach to this monitor (see uptimekuma_list_notifications for IDs)'),
     }),
     handler: async (args) => {
-      const opts = {
+      const opts: Record<string, any> = {
         ...args,
         accepted_statuscodes: args.accepted_statuscodes
           ? args.accepted_statuscodes.split(',').map((s: string) => s.trim())
           : ['200-299'],
       };
+      if (Array.isArray(args.notificationIds)) {
+        opts.notificationIDList = Object.fromEntries(
+          args.notificationIds.map((id: number) => [String(id), true]),
+        );
+        delete opts.notificationIds;
+      }
       return getClient(args.instance).addMonitor(opts);
     },
   },
@@ -209,11 +216,18 @@ export const toolDefs: ToolDef[] = [
       ignoreTls:          z.boolean().optional().describe('Ignore TLS errors'),
       description:        z.string().optional().describe('New description'),
       parent:             z.number().int().nullable().optional().describe('Parent group monitor ID (null to move to root)'),
+      notificationIds:    z.array(z.number().int()).optional().describe('Notification provider IDs to attach (replaces the monitor\'s current notification assignments)'),
     }),
     handler: async (args) => {
       const { instance, monitorId, ...opts } = args;
       if (opts.accepted_statuscodes) {
         opts.accepted_statuscodes = opts.accepted_statuscodes.split(',').map((s: string) => s.trim());
+      }
+      if (Array.isArray(opts.notificationIds)) {
+        opts.notificationIDList = Object.fromEntries(
+          opts.notificationIds.map((id: number) => [String(id), true]),
+        );
+        delete opts.notificationIds;
       }
       return getClient(instance).editMonitor(monitorId, opts);
     },
@@ -244,5 +258,121 @@ export const toolDefs: ToolDef[] = [
       monitorId: z.number().int().positive().describe('The numeric ID of the monitor to resume'),
     }),
     handler: async (args) => getClient(args.instance).resumeMonitor(args.monitorId),
+  },
+
+  // ── Notification provider operations ─────────────────────────────
+
+  {
+    name: 'uptimekuma_create_notification',
+    description:
+      'Create a new notification provider (e.g. ntfy, Telegram, Slack, webhook). ' +
+      'Provide the provider `type` and a `config` object holding the type-specific ' +
+      'fields. For ntfy, config typically includes: ntfyserverurl, ntfytopic, ' +
+      'ntfyPriority, ntfyAuthenticationMethod. Returns the new provider id.',
+    schema: z.object({
+      instance:      Instance,
+      name:          z.string().min(1).describe('Display name for the notification provider'),
+      type:          z.string().describe('Provider type, e.g. "ntfy", "telegram", "slack", "webhook"'),
+      config:        z.record(z.any()).optional().describe('Type-specific settings merged into the provider config (e.g. { ntfyserverurl, ntfytopic, ntfyPriority })'),
+      isDefault:     z.boolean().optional().default(false).describe('Apply automatically to newly created monitors'),
+      applyExisting: z.boolean().optional().default(false).describe('Immediately attach to all existing monitors on save'),
+    }),
+    handler: async (args) => {
+      const notification = {
+        name: args.name,
+        type: args.type,
+        isDefault: args.isDefault ?? false,
+        applyExisting: args.applyExisting ?? false,
+        ...(args.config ?? {}),
+      };
+      return getClient(args.instance).saveNotification(notification, null);
+    },
+  },
+  {
+    name: 'uptimekuma_update_notification',
+    description:
+      'Update an existing notification provider. The current config is fetched and ' +
+      'merged with the fields you supply, so you only need to pass what changes.',
+    schema: z.object({
+      instance:       Instance,
+      notificationId: z.number().int().positive().describe('The numeric ID of the notification provider to update'),
+      name:           z.string().optional().describe('New display name'),
+      type:           z.string().optional().describe('New provider type'),
+      config:         z.record(z.any()).optional().describe('Type-specific settings to merge into the existing config'),
+      isDefault:      z.boolean().optional().describe('Apply automatically to newly created monitors'),
+      applyExisting:  z.boolean().optional().describe('Immediately attach to all existing monitors on save'),
+    }),
+    handler: async (args) => {
+      const client = getClient(args.instance);
+      const existing = await client.getNotification(args.notificationId);
+      if (!existing) {
+        throw new Error(`Notification provider ${args.notificationId} not found`);
+      }
+      // The cached `config` may be an object or a JSON string depending on the
+      // Uptime Kuma version — handle both defensively.
+      let currentConfig: Record<string, any> = {};
+      const rawConfig = (existing as any).config;
+      if (rawConfig && typeof rawConfig === 'object') {
+        currentConfig = rawConfig;
+      } else if (typeof rawConfig === 'string') {
+        try { currentConfig = JSON.parse(rawConfig); } catch { currentConfig = {}; }
+      }
+      const merged: Record<string, any> = {
+        ...currentConfig,
+        ...(args.name !== undefined ? { name: args.name } : {}),
+        ...(args.type !== undefined ? { type: args.type } : {}),
+        ...(args.isDefault !== undefined ? { isDefault: args.isDefault } : {}),
+        ...(args.applyExisting !== undefined ? { applyExisting: args.applyExisting } : {}),
+        ...(args.config ?? {}),
+      };
+      // Kuma requires name and type to be present on save.
+      if (merged.name === undefined) merged.name = (existing as any).name;
+      return client.saveNotification(merged, args.notificationId);
+    },
+  },
+  {
+    name: 'uptimekuma_delete_notification',
+    description: 'Permanently delete a notification provider by ID. This cannot be undone.',
+    schema: z.object({
+      instance:       Instance,
+      notificationId: z.number().int().positive().describe('The numeric ID of the notification provider to delete'),
+    }),
+    handler: async (args) => getClient(args.instance).deleteNotification(args.notificationId),
+  },
+  {
+    name: 'uptimekuma_set_monitor_notifications',
+    description:
+      'Set exactly which notification providers are attached to a single monitor. ' +
+      "Replaces the monitor's current notification assignments with the given list " +
+      '(pass an empty array to detach all).',
+    schema: z.object({
+      instance:        Instance,
+      monitorId:       z.number().int().positive().describe('The numeric ID of the monitor'),
+      notificationIds: z.array(z.number().int()).describe('Notification provider IDs to attach (replaces existing). Empty array detaches all.'),
+    }),
+    handler: async (args) => {
+      const map: Record<string, boolean> = {};
+      for (const id of args.notificationIds) map[String(id)] = true;
+      return getClient(args.instance).setMonitorNotifications(args.monitorId, map);
+    },
+  },
+  {
+    name: 'uptimekuma_apply_notification_to_all_monitors',
+    description:
+      'Attach or detach a single notification provider across ALL monitors at once, ' +
+      "preserving each monitor's other notification assignments. Strongly recommend " +
+      'running with dryRun=true first to preview exactly which monitors would change.',
+    schema: z.object({
+      instance:       Instance,
+      notificationId: z.number().int().positive().describe('The notification provider ID to apply'),
+      enabled:        z.boolean().optional().default(true).describe('true = attach to all monitors, false = detach from all'),
+      includeGroups:  z.boolean().optional().default(false).describe('Also apply to group monitors (default skips groups)'),
+      dryRun:         z.boolean().optional().default(false).describe('Preview the changes without applying them'),
+    }),
+    handler: async (args) =>
+      getClient(args.instance).applyNotificationToAllMonitors(args.notificationId, args.enabled, {
+        dryRun: args.dryRun,
+        includeGroups: args.includeGroups,
+      }),
   },
 ];

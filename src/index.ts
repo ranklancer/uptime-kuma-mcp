@@ -10,6 +10,27 @@ import { disconnectAll } from './instances.js';
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
 const HOST = process.env.HOST ?? '0.0.0.0';
 
+/** Convert a single (already optional/default-unwrapped) Zod type to JSON Schema. */
+function zodTypeToJson(v: z.ZodType<any>): Record<string, any> {
+  // Unwrap nullable/optional/default wrappers to reach the underlying type.
+  while (
+    v instanceof z.ZodOptional ||
+    v instanceof z.ZodDefault ||
+    v instanceof z.ZodNullable
+  ) {
+    v = (v as any)._def.innerType;
+  }
+
+  if (v instanceof z.ZodString)  return { type: 'string' };
+  if (v instanceof z.ZodNumber)  return { type: 'number' };
+  if (v instanceof z.ZodBoolean) return { type: 'boolean' };
+  if (v instanceof z.ZodEnum)    return { type: 'string', enum: (v as any)._def.values };
+  if (v instanceof z.ZodArray)   return { type: 'array', items: zodTypeToJson((v as any)._def.type) };
+  if (v instanceof z.ZodRecord)  return { type: 'object' };
+  if (v instanceof z.ZodObject)  return { type: 'object' };
+  return { type: 'string' };
+}
+
 /** Minimal Zod-to-JSON-Schema converter for MCP tool registration. */
 function zodToJsonSchema(schema: z.ZodType<any>): Record<string, any> {
   if (!(schema instanceof z.ZodObject)) return { type: 'object' };
@@ -24,11 +45,7 @@ function zodToJsonSchema(schema: z.ZodType<any>): Record<string, any> {
     if (v instanceof z.ZodOptional) { v = (v as any)._def.innerType; optional = true; }
     if (v instanceof z.ZodDefault)  { v = (v as any)._def.innerType; optional = true; }
 
-    let prop: Record<string, any> = { type: 'string' };
-    if      (v instanceof z.ZodString)  prop = { type: 'string' };
-    else if (v instanceof z.ZodNumber)  prop = { type: 'number' };
-    else if (v instanceof z.ZodBoolean) prop = { type: 'boolean' };
-    else if (v instanceof z.ZodEnum)    prop = { type: 'string', enum: (v as any)._def.values };
+    const prop: Record<string, any> = zodTypeToJson(v);
 
     if ((val as any)?._def?.description) prop.description = (val as any)._def.description;
 

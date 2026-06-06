@@ -25,6 +25,17 @@ export class UptimeKumaClient {
    */
   private heartbeatStatusCache: Map<number, number> = new Map();
 
+  /**
+   * Cached notification provider list. Uptime Kuma pushes the full list via
+   * the 'notificationList' Socket.IO event after login — there is NO
+   * request/response 'getNotificationList' event, which is why the old
+   * emitWithAck('getNotificationList') call always timed out. We mirror the
+   * monitorList caching pattern instead for reliable, instant reads.
+   */
+  private notificationCache: any[] = [];
+  private notificationCacheReady = false;
+  private notificationCacheWaiters: Array<() => void> = [];
+
   constructor(private cfg: KumaInstanceConfig) {}
 
   // ── Connection management ───────────────────────────────────
@@ -53,6 +64,8 @@ export class UptimeKumaClient {
     this.monitorCache = {};
     this.monitorCacheReady = false;
     this.heartbeatStatusCache.clear();
+    this.notificationCache = [];
+    this.notificationCacheReady = false;
 
     this.socket = io(this.cfg.baseUrl, {
       path: '/socket.io',
@@ -73,6 +86,19 @@ export class UptimeKumaClient {
         // Wake up anyone waiting for the initial list
         for (const resolve of this.monitorCacheWaiters) resolve();
         this.monitorCacheWaiters = [];
+      }
+    });
+
+    // Listen for notification list pushes. Uptime Kuma emits 'notificationList'
+    // after login and on every notification change — directly analogous to the
+    // monitorList event above. This is the reliable source of truth (there is
+    // no ack-based 'getNotificationList' event server-side).
+    this.socket.on('notificationList', (data: any[]) => {
+      this.notificationCache = Array.isArray(data) ? data : [];
+      if (!this.notificationCacheReady) {
+        this.notificationCacheReady = true;
+        for (const resolve of this.notificationCacheWaiters) resolve();
+        this.notificationCacheWaiters = [];
       }
     });
 
@@ -181,6 +207,23 @@ export class UptimeKumaClient {
     });
   }
 
+  /**
+   * Wait until the notification list has been pushed at least once.
+   * Uptime Kuma sends 'notificationList' shortly after login.
+   */
+  private async waitForNotificationCache(timeoutMs = 15_000): Promise<void> {
+    if (this.notificationCacheReady) return;
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`[${this.cfg.name}] timeout waiting for notificationList event`));
+      }, timeoutMs);
+      this.notificationCacheWaiters.push(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+
   /** Disconnect the Socket.IO client gracefully. */
   async disconnect(): Promise<void> {
     if (this.socket) {
@@ -192,6 +235,8 @@ export class UptimeKumaClient {
     this.monitorCache = {};
     this.monitorCacheReady = false;
     this.heartbeatStatusCache.clear();
+    this.notificationCache = [];
+    this.notificationCacheReady = false;
   }
 
   // ── Read operations ─────────────────────────────────────────
@@ -225,11 +270,26 @@ export class UptimeKumaClient {
     return res;
   }
 
-  /** List notification channels. */
-  async listNotifications(): Promise<any> {
+  /**
+   * List notification providers. Returns the list pushed by Uptime Kuma via the
+   * 'notificationList' event (cached). Each item: { id, name, active, userId,
+   * isDefault, config } where `config` holds the type-specific settings.
+   *
+   * NOTE: previously this used emitWithAck('getNotificationList'), which has no
+   * server-side ack handler and therefore always timed out. The cache approach
+   * is reliable and returns instantly once the post-login push has arrived.
+   */
+  async listNotifications(): Promise<any[]> {
     await this.ensureConnected();
-    const res = await this.emitWithAck('getNotificationList');
-    return res;
+    await this.waitForNotificationCache();
+    return this.notificationCache;
+  }
+
+  /** Return a single cached notification provider by ID, or undefined. */
+  async getNotification(notificationId: number): Promise<any | undefined> {
+    await this.ensureConnected();
+    await this.waitForNotificationCache();
+    return this.notificationCache.find((n: any) => n?.id === notificationId);
   }
 
   /** List status pages. */
@@ -330,5 +390,116 @@ export class UptimeKumaClient {
       throw new Error(`[${this.cfg.name}] resume monitor failed: ${res?.msg ?? 'unknown'}`);
     }
     return res;
+  }
+
+  // ── Notification provider write operations ──────────────────
+
+  /**
+   * Create or update a notification provider.
+   * Pass notificationID = null to create, or an existing ID to update.
+   * `notification` is a flat config object: { name, type, isDefault,
+   * applyExisting, ...type-specific fields }. Uptime Kuma serialises the whole
+   * object as the provider's JSON config.
+   * Returns { ok, msg, id }.
+   */
+  async saveNotification(
+    notification: Record<string, any>,
+    notificationID: number | null = null,
+  ): Promise<any> {
+    await this.ensureConnected();
+    const res = await this.emitWithAck('addNotification', notification, notificationID ?? null);
+    if (!res?.ok) {
+      throw new Error(`[${this.cfg.name}] save notification failed: ${res?.msg ?? 'unknown'}`);
+    }
+    return res;
+  }
+
+  /** Delete a notification provider by ID. Returns { ok, msg }. */
+  async deleteNotification(notificationID: number): Promise<any> {
+    await this.ensureConnected();
+    const res = await this.emitWithAck('deleteNotification', notificationID);
+    if (!res?.ok) {
+      throw new Error(`[${this.cfg.name}] delete notification failed: ${res?.msg ?? 'unknown'}`);
+    }
+    return res;
+  }
+
+  // ── Monitor ↔ notification assignment ───────────────────────
+
+  /**
+   * Replace a monitor's notification assignments with the given map.
+   * `notificationIDList` looks like { "1": true, "2": true }. An empty map
+   * detaches all notifications. Delegates to editMonitor, which fetches the
+   * current monitor and merges, so all other monitor settings are preserved.
+   */
+  async setMonitorNotifications(
+    monitorId: number,
+    notificationIDList: Record<string, boolean>,
+  ): Promise<any> {
+    return this.editMonitor(monitorId, { notificationIDList });
+  }
+
+  /**
+   * Attach or detach a single notification provider across all monitors,
+   * preserving each monitor's other notification assignments.
+   *
+   * When opts.dryRun is true, returns the planned changes WITHOUT applying them
+   * — use this to preview a bulk migration safely. Group monitors are skipped
+   * unless opts.includeGroups is true.
+   */
+  async applyNotificationToAllMonitors(
+    notificationId: number,
+    enabled: boolean,
+    opts: { dryRun?: boolean; includeGroups?: boolean } = {},
+  ): Promise<any> {
+    await this.ensureConnected();
+    const monitors = await this.listMonitors();
+    const list = Object.values(monitors) as any[];
+    const key = String(notificationId);
+
+    const planned: Array<{ id: number; name: string; from: boolean; to: boolean }> = [];
+    for (const m of list) {
+      if (!opts.includeGroups && m.type === 'group') continue;
+      const current = !!(m.notificationIDList && m.notificationIDList[key]);
+      if (current === enabled) continue; // already in desired state — skip
+      planned.push({ id: m.id, name: m.name, from: current, to: enabled });
+    }
+
+    if (opts.dryRun) {
+      return {
+        dryRun: true,
+        notificationId,
+        enabled,
+        totalMonitors: list.length,
+        toChange: planned.length,
+        changes: planned,
+      };
+    }
+
+    const results: Array<{ id: number; name: string; ok: boolean; error?: string }> = [];
+    for (const p of planned) {
+      try {
+        const m = (monitors as Record<string, any>)[String(p.id)]
+          ?? list.find((x: any) => x.id === p.id);
+        const newList: Record<string, boolean> = { ...(m?.notificationIDList ?? {}) };
+        if (enabled) newList[key] = true;
+        else delete newList[key];
+        await this.editMonitor(p.id, { notificationIDList: newList });
+        results.push({ id: p.id, name: p.name, ok: true });
+      } catch (err: any) {
+        results.push({ id: p.id, name: p.name, ok: false, error: String(err?.message ?? err) });
+      }
+    }
+
+    return {
+      dryRun: false,
+      notificationId,
+      enabled,
+      totalMonitors: list.length,
+      attempted: planned.length,
+      succeeded: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      results,
+    };
   }
 }
