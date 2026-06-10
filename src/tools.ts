@@ -44,14 +44,19 @@ export const toolDefs: ToolDef[] = [
       tag:     z.string().optional().describe('Filter monitors that have this tag name'),
     }),
     handler: async (args) => {
-      const monitors = await getClient(args.instance).listMonitors();
+      const client = getClient(args.instance);
+      const monitors = await client.listMonitors();
       let list = Object.values(monitors);
 
       if (args.type) list = list.filter((m: any) => m.type === args.type);
       if (args.status) {
+        // Filter on LIVE heartbeat state, not the `active` (paused) flag.
+        // 0=DOWN, 1=UP, 2=PENDING, 3=MAINTENANCE. Paused monitors (active=false)
+        // have no live status and must never match up/down/pending/maintenance.
         const statusMap: Record<string, number> = { down: 0, up: 1, pending: 2, maintenance: 3 };
-        const code = statusMap[args.status];
-        list = list.filter((m: any) => m.active === (code === 1 || code === 2 || code === 3));
+        const wanted = statusMap[args.status];
+        const heartbeatStatuses = client.getHeartbeatStatuses();
+        list = list.filter((m: any) => m.active && heartbeatStatuses.get(m.id) === wanted);
       }
       if (args.keyword) {
         const kw = args.keyword.toLowerCase();
@@ -125,12 +130,13 @@ export const toolDefs: ToolDef[] = [
   {
     name: 'uptimekuma_list_heartbeats',
     description:
-      'Get heartbeat history for a specific monitor. Returns recent up/down events with response times.',
+      'Get heartbeat history for a specific monitor over the last N hours. Returns recent up/down events with response times.',
     schema: z.object({
       instance:  Instance,
       monitorId: z.number().int().positive().describe('The numeric ID of the monitor'),
+      hours:     z.number().int().positive().optional().default(24).describe('How many hours of heartbeat history to return (default 24).'),
     }),
-    handler: async (args) => getClient(args.instance).getHeartbeats(args.monitorId),
+    handler: async (args) => getClient(args.instance).getHeartbeats(args.monitorId, args.hours),
   },
   {
     name: 'uptimekuma_list_notifications',
