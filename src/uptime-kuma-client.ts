@@ -337,10 +337,18 @@ export class UptimeKumaClient {
     return res;
   }
 
-  /** Get heartbeat history for a monitor. */
-  async getHeartbeats(monitorId: number): Promise<any> {
+  /**
+   * Get heartbeat history for a monitor over the last `periodHours` hours.
+   *
+   * Uptime Kuma's server-side getMonitorBeats treats the second argument as a
+   * POSITIVE number of hours to look back (it binds `-period` into the SQL time
+   * window). The previous value of `-1` therefore produced a `+1h` window into
+   * the FUTURE, which matched no past beats and always returned empty. Passing a
+   * positive hours window (default 24h) returns the expected recent beats.
+   */
+  async getHeartbeats(monitorId: number, periodHours = 24): Promise<any> {
     await this.ensureConnected();
-    const res = await this.emitWithAck('getMonitorBeats', monitorId, -1);
+    const res = await this.emitWithAck('getMonitorBeats', monitorId, periodHours);
     return res;
   }
 
