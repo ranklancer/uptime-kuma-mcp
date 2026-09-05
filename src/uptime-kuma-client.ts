@@ -424,6 +424,11 @@ export class UptimeKumaClient {
       port: opts.port,
       keyword: opts.keyword,
       accepted_statuscodes: opts.accepted_statuscodes ?? ['200-299'],
+      // Uptime Kuma 2.x has a NOT NULL constraint on monitor.conditions. Omitting
+      // the key entirely makes the server store NULL, so every add fails with
+      // "SQLITE_CONSTRAINT: NOT NULL constraint failed: monitor.conditions".
+      // Always send an explicit (possibly empty) array. Do not remove.
+      conditions: opts.conditions ?? [],
       ignoreTls: opts.ignoreTls ?? false,
       expiryNotification: opts.expiryNotification ?? false,
       maxredirects: opts.maxredirects ?? 10,
