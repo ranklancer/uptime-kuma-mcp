@@ -420,7 +420,7 @@ export class UptimeKumaClient {
     return res;
   }
 
-  /** Resume a paused monitor by ID. */
+  /** Resume a monitor by ID. */
   async resumeMonitor(monitorId: number): Promise<any> {
     await this.ensureConnected();
     const res = await this.emitWithAck('resumeMonitor', monitorId);
