@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { getClient, allInstanceNames } from './instances.js';
 import { MONITOR_TYPES } from './types.js';
+import { scrubUrlField } from './redact.js';
 
 /**
  * Build an instance selector enum from the configured instance names.
@@ -75,8 +76,8 @@ export const toolDefs: ToolDef[] = [
           id: m.id,
           name: m.name,
           type: m.type,
-          url: m.url,
-          hostname: m.hostname,
+          url: scrubUrlField(m.url),
+          hostname: scrubUrlField(m.hostname),
           port: m.port,
           interval: m.interval,
           active: m.active,
@@ -89,7 +90,9 @@ export const toolDefs: ToolDef[] = [
   {
     name: 'uptimekuma_get_monitor',
     description:
-      'Get detailed information about a single monitor including its configuration and recent heartbeats.',
+      'Get detailed information about a single monitor including its configuration. ' +
+      'Credential fields (push token, passwords, headers, connection strings, keys) are redacted: ' +
+      'each is returned as { value: "***REDACTED***", present: boolean }.',
     schema: z.object({
       instance:  Instance,
       monitorId: z.number().int().positive().describe('The numeric ID of the monitor'),
@@ -309,31 +312,7 @@ export const toolDefs: ToolDef[] = [
       applyExisting:  z.boolean().optional().describe('Immediately attach to all existing monitors on save'),
     }),
     handler: async (args) => {
-      const client = getClient(args.instance);
-      const existing = await client.getNotification(args.notificationId);
-      if (!existing) {
-        throw new Error(`Notification provider ${args.notificationId} not found`);
-      }
-      // The cached `config` may be an object or a JSON string depending on the
-      // Uptime Kuma version — handle both defensively.
-      let currentConfig: Record<string, any> = {};
-      const rawConfig = (existing as any).config;
-      if (rawConfig && typeof rawConfig === 'object') {
-        currentConfig = rawConfig;
-      } else if (typeof rawConfig === 'string') {
-        try { currentConfig = JSON.parse(rawConfig); } catch { currentConfig = {}; }
-      }
-      const merged: Record<string, any> = {
-        ...currentConfig,
-        ...(args.name !== undefined ? { name: args.name } : {}),
-        ...(args.type !== undefined ? { type: args.type } : {}),
-        ...(args.isDefault !== undefined ? { isDefault: args.isDefault } : {}),
-        ...(args.applyExisting !== undefined ? { applyExisting: args.applyExisting } : {}),
-        ...(args.config ?? {}),
-      };
-      // Kuma requires name and type to be present on save.
-      if (merged.name === undefined) merged.name = (existing as any).name;
-      return client.saveNotification(merged, args.notificationId);
+      return getClient(args.instance).updateNotification(args.notificationId, args);
     },
   },
   {

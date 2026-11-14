@@ -1,81 +1,11 @@
 import { io, Socket } from 'socket.io-client';
 import type { KumaInstanceConfig, KumaSession, MonitorOpts } from './types.js';
+import {
+  redactMonitorAck, redactHeartbeatAck, redactNotification, safeFailureText,
+  assertMonitorEditAllowed, assertNotificationEditAllowed,
+} from './redact.js';
 
 const TOKEN_TTL_MS = 48 * 60 * 60 * 1000; // re-auth every 48h to be safe
-
-const REDACTED = '***REDACTED***';
-
-/**
- * True if a notification-config field NAME implies it holds a secret.
- * Covers *token / *password / *secret / *key suffixes, common secret words,
- * and auth-header fields (which routinely embed bearer tokens).
- */
-function isSecretFieldName(name: string): boolean {
-  const n = name.toLowerCase();
-  if (/header/.test(n)) return true; // e.g. webhookAdditionalHeaders -> bearer/token
-  if (/(token|password|passwd|pwd|secret|apikey|api_key|accesskey|access_key|privatekey|private_key|credential|signingkey|appkey|authkey)/.test(n)) return true;
-  if (/key$/.test(n)) return true;   // *key
-  return false;
-}
-
-/** True if a string is a URL that embeds credentials (userinfo or secret query param). */
-function urlEmbedsCreds(val: unknown): boolean {
-  if (typeof val !== 'string') return false;
-  // scheme://user:pass@host
-  if (/:\/\/[^/@\s]+:[^/@\s]+@/.test(val)) return true;
-  // credential-bearing query params
-  if (/[?&](?:token|access_token|api_?key|key|secret|password|passwd|auth|sig|signature|tk)=/i.test(val)) return true;
-  return false;
-}
-
-/** Recursively mask secret-bearing values in a parsed notification config object. */
-function redactConfigObject(obj: any): any {
-  if (Array.isArray(obj)) return obj.map(redactConfigObject);
-  if (obj && typeof obj === 'object') {
-    const out: Record<string, any> = {};
-    for (const [k, v] of Object.entries(obj)) {
-      if (v && typeof v === 'object') {
-        out[k] = redactConfigObject(v);
-      } else if (isSecretFieldName(k) && v !== undefined && v !== null && v !== '') {
-        out[k] = REDACTED;                       // keep field name, mask value
-      } else if (/url|uri/i.test(k) && urlEmbedsCreds(v)) {
-        out[k] = REDACTED;                       // credential-bearing URL
-      } else if (typeof v === 'string' && /^[a-z]+:\/\//i.test(v) && urlEmbedsCreds(v)) {
-        out[k] = REDACTED;                       // value is a URL embedding creds
-      } else {
-        out[k] = v;
-      }
-    }
-    return out;
-  }
-  return obj;
-}
-
-/**
- * Return a copy of a notification-provider record with secrets in its `config`
- * masked. Read paths use this so callers can see that a provider *has* a token
- * (field name preserved) without seeing the value. The cache itself is never
- * mutated — internal merge paths (getNotification) read the raw values.
- *
- * `config` may be a JSON string (Uptime Kuma's wire format) or an object,
- * depending on version; both are handled. If a string config can't be parsed,
- * it is fully redacted rather than risk leaking.
- */
-function redactNotificationProvider(provider: any): any {
-  if (!provider || typeof provider !== 'object') return provider;
-  const raw = provider.config;
-  let redactedConfig: any = raw;
-  if (typeof raw === 'string') {
-    try {
-      redactedConfig = JSON.stringify(redactConfigObject(JSON.parse(raw)));
-    } catch {
-      redactedConfig = REDACTED;
-    }
-  } else if (raw && typeof raw === 'object') {
-    redactedConfig = redactConfigObject(raw);
-  }
-  return { ...provider, config: redactedConfig };
-}
 
 export class UptimeKumaClient {
   private socket: Socket | null = null;
@@ -330,11 +260,20 @@ export class UptimeKumaClient {
     return this.heartbeatStatusCache;
   }
 
-  /** Get a single monitor by ID with recent heartbeats. */
+  /**
+   * Get a single monitor by ID. REDACTED: Kuma's getMonitor ack carries every
+   * monitor credential (push token, basic-auth password, headers, DSN, ...), so
+   * the ack is projected through the allowlist in redact.ts. Internal merge
+   * paths (editMonitor) must use getMonitorRaw instead.
+   */
   async getMonitor(monitorId: number): Promise<any> {
+    return redactMonitorAck(await this.getMonitorRaw(monitorId));
+  }
+
+  /** INTERNAL / RAW: unredacted ack. Never return this from a tool; editMonitor needs the real values to merge. */
+  private async getMonitorRaw(monitorId: number): Promise<any> {
     await this.ensureConnected();
-    const res = await this.emitWithAck('getMonitor', monitorId);
-    return res;
+    return this.emitWithAck('getMonitor', monitorId);
   }
 
   /**
@@ -349,7 +288,7 @@ export class UptimeKumaClient {
   async getHeartbeats(monitorId: number, periodHours = 24): Promise<any> {
     await this.ensureConnected();
     const res = await this.emitWithAck('getMonitorBeats', monitorId, periodHours);
-    return res;
+    return redactHeartbeatAck(res);
   }
 
   /**
@@ -361,14 +300,16 @@ export class UptimeKumaClient {
    * server-side ack handler and therefore always timed out. The cache approach
    * is reliable and returns instantly once the post-login push has arrived.
    *
-   * SECRETS: provider `config` blobs hold live secrets (access tokens, webhook
-   * auth headers, etc.). This read path masks them via redactNotificationProvider
-   * so callers never receive raw secret values. The cache is left untouched.
+   * SECRETS: provider `config` blobs hold live secrets (access tokens, webhook URLs
+   * with the secret in the path, auth headers). This read path is an ALLOWLIST
+   * projection (redactNotification): only type/name/flags/topic/priority and a
+   * host-only ntfy server URL pass; every other config key is { value, present }.
+   * The cache is left untouched.
    */
   async listNotifications(): Promise<any[]> {
     await this.ensureConnected();
     await this.waitForNotificationCache();
-    return this.notificationCache.map(redactNotificationProvider);
+    return this.notificationCache.map(redactNotification);
   }
 
   /**
@@ -378,7 +319,7 @@ export class UptimeKumaClient {
    * it is used by update_notification to fetch-merge-save the existing config —
    * masking here would write '***REDACTED***' back over real secrets. It is not
    * exposed as a read tool. Read-facing output must go through listNotifications
-   * (or redactNotificationProvider) instead.
+   * (or redactNotification) instead.
    */
   async getNotification(notificationId: number): Promise<any | undefined> {
     await this.ensureConnected();
@@ -435,25 +376,28 @@ export class UptimeKumaClient {
     };
     const res = await this.emitWithAck('add', monitorData);
     if (!res?.ok) {
-      throw new Error(`[${this.cfg.name}] add monitor failed: ${res?.msg ?? 'unknown'}`);
+      throw new Error(`[${this.cfg.name}] add monitor failed: ${safeFailureText(res)}`);
     }
-    return res;
+    return redactMonitorAck(res);
   }
 
   /** Edit an existing monitor. */
   async editMonitor(monitorId: number, opts: MonitorOpts): Promise<any> {
     await this.ensureConnected();
     // Fetch current data first to merge
-    const current = await this.emitWithAck('getMonitor', monitorId);
+    const current = await this.getMonitorRaw(monitorId);
     if (!current?.monitor) {
       throw new Error(`[${this.cfg.name}] monitor ${monitorId} not found`);
     }
+    // H1: a monitor that holds credentials may not be repointed (Kuma would send the stored
+    // credentials to the new destination on the next check). Compared against RAW values.
+    assertMonitorEditAllowed(current.monitor, opts);
     const merged = { ...current.monitor, ...opts, id: monitorId };
     const res = await this.emitWithAck('editMonitor', merged);
     if (!res?.ok) {
-      throw new Error(`[${this.cfg.name}] edit monitor failed: ${res?.msg ?? 'unknown'}`);
+      throw new Error(`[${this.cfg.name}] edit monitor failed: ${safeFailureText(res)}`);
     }
-    return res;
+    return redactMonitorAck(res);
   }
 
   /** Delete a monitor by ID. */
@@ -461,7 +405,7 @@ export class UptimeKumaClient {
     await this.ensureConnected();
     const res = await this.emitWithAck('deleteMonitor', monitorId);
     if (!res?.ok) {
-      throw new Error(`[${this.cfg.name}] delete monitor failed: ${res?.msg ?? 'unknown'}`);
+      throw new Error(`[${this.cfg.name}] delete monitor failed: ${safeFailureText(res)}`);
     }
     return res;
   }
@@ -471,7 +415,7 @@ export class UptimeKumaClient {
     await this.ensureConnected();
     const res = await this.emitWithAck('pauseMonitor', monitorId);
     if (!res?.ok) {
-      throw new Error(`[${this.cfg.name}] pause monitor failed: ${res?.msg ?? 'unknown'}`);
+      throw new Error(`[${this.cfg.name}] pause monitor failed: ${safeFailureText(res)}`);
     }
     return res;
   }
@@ -481,7 +425,7 @@ export class UptimeKumaClient {
     await this.ensureConnected();
     const res = await this.emitWithAck('resumeMonitor', monitorId);
     if (!res?.ok) {
-      throw new Error(`[${this.cfg.name}] resume monitor failed: ${res?.msg ?? 'unknown'}`);
+      throw new Error(`[${this.cfg.name}] resume monitor failed: ${safeFailureText(res)}`);
     }
     return res;
   }
@@ -503,9 +447,41 @@ export class UptimeKumaClient {
     await this.ensureConnected();
     const res = await this.emitWithAck('addNotification', notification, notificationID ?? null);
     if (!res?.ok) {
-      throw new Error(`[${this.cfg.name}] save notification failed: ${res?.msg ?? 'unknown'}`);
+      throw new Error(`[${this.cfg.name}] save notification failed: ${safeFailureText(res)}`);
     }
     return res;
+  }
+
+  /**
+   * Fetch-merge-save update of a notification provider. If the stored config holds any
+   * secret, destination-shaping keys (server/webhook URLs, type, ...) cannot be changed
+   * (H1): the next alert would send the stored token to the new destination.
+   */
+  async updateNotification(
+    notificationId: number,
+    args: { name?: string; type?: string; isDefault?: boolean; applyExisting?: boolean; config?: Record<string, any> },
+  ): Promise<any> {
+    const existing = await this.getNotification(notificationId);
+    if (!existing) throw new Error(`Notification provider ${notificationId} not found`);
+    // The cached `config` may be an object or a JSON string depending on the Kuma version.
+    let currentConfig: Record<string, any> = {};
+    const rawConfig = (existing as any).config;
+    if (rawConfig && typeof rawConfig === 'object') currentConfig = rawConfig;
+    else if (typeof rawConfig === 'string') {
+      try { currentConfig = JSON.parse(rawConfig); } catch { currentConfig = {}; }
+    }
+    const changes: Record<string, unknown> = {
+      ...(args.name !== undefined ? { name: args.name } : {}),
+      ...(args.type !== undefined ? { type: args.type } : {}),
+      ...(args.isDefault !== undefined ? { isDefault: args.isDefault } : {}),
+      ...(args.applyExisting !== undefined ? { applyExisting: args.applyExisting } : {}),
+      ...(args.config ?? {}),
+    };
+    assertNotificationEditAllowed(currentConfig, changes);
+    const merged: Record<string, any> = { ...currentConfig, ...changes };
+    // Kuma requires name and type to be present on save.
+    if (merged.name === undefined) merged.name = (existing as any).name;
+    return this.saveNotification(merged, notificationId);
   }
 
   /** Delete a notification provider by ID. Returns { ok, msg }. */
@@ -513,7 +489,7 @@ export class UptimeKumaClient {
     await this.ensureConnected();
     const res = await this.emitWithAck('deleteNotification', notificationID);
     if (!res?.ok) {
-      throw new Error(`[${this.cfg.name}] delete notification failed: ${res?.msg ?? 'unknown'}`);
+      throw new Error(`[${this.cfg.name}] delete notification failed: ${safeFailureText(res)}`);
     }
     return res;
   }
