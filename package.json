@@ -19,6 +19,8 @@
     "build": "npx tsc",
     "start": "node dist/index.js",
     "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
