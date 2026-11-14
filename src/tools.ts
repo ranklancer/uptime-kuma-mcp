@@ -166,7 +166,7 @@ export const toolDefs: ToolDef[] = [
     handler: async (args) => getClient(args.instance).listMaintenance(),
   },
 
-  // ── Write operations ────────────────────────────────────────
+  // ── Write operations ────────────────────────────────────────────
 
   {
     name: 'uptimekuma_add_monitor',
