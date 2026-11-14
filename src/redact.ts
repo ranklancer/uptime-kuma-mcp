@@ -244,7 +244,7 @@ export function redactMonitorAck(res: any): any {
   return out;
 }
 
-// ── Heartbeats (list_heartbeats) ────────────────────────────────────────────────────────────────
+// ── Heartbeats (list_heartbeats) ────────────────────────────────────────────
 
 /**
  * Heartbeat `msg` is free text. Kuma writes `"Your JSON body is invalid. " + e.message`
@@ -287,7 +287,7 @@ export function redactHeartbeatAck(res: any): any {
   return out;
 }
 
-// ── Notification providers (list_notifications) ──────────────────────────────────────────────
+// ── Notification providers (list_notifications) ─────────────────────────────
 
 /** Config keys shown as-is. Everything else is `{value, present}`. */
 const NOTIF_SAFE_CONFIG = new Set(['type', 'name', 'isDefault', 'applyExisting', 'active', 'ntfyPriority', 'ntfyAuthenticationMethod']);
@@ -319,7 +319,7 @@ export function redactNotification(p: any): any {
   return out;
 }
 
-// ── Write guards (H1) ─────────────────────────────────────────────────────────────────────
+// ── Write guards (H1) ───────────────────────────────────────────────────────
 
 /**
  * Monitor fields that, if holding a value, count as a credential for the edit guard.
