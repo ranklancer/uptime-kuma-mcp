@@ -13,6 +13,29 @@ export function isNotLoggedIn(res: any): boolean {
 
 const TOKEN_TTL_MS = 48 * 60 * 60 * 1000; // re-auth every 48h to be safe
 
+/** Merge desired groups with the existing list so group ids and per-monitor sendUrl/url carry over. */
+export function mergeGroups(existing: any[], groups: Array<{ name: string; monitorIds: number[] }>): any[] {
+  const byName = new Map<string, any>(existing.map((g) => [g?.name, g]));
+  const anyMonitor = new Map<number, any>();
+  for (const g of existing) for (const m of g?.monitorList ?? []) anyMonitor.set(m.id, m);
+  return groups.map((g) => {
+    const old = byName.get(g.name);
+    const oldMon = new Map<number, any>((old?.monitorList ?? []).map((m: any) => [m.id, m]));
+    const out: Record<string, any> = {
+      name: g.name,
+      monitorList: g.monitorIds.map((id) => {
+        const prev = oldMon.get(id) ?? anyMonitor.get(id);
+        const m: Record<string, any> = { id };
+        if (prev?.sendUrl !== undefined) m.sendUrl = prev.sendUrl;
+        if (prev?.url !== undefined) m.url = prev.url;
+        return m;
+      }),
+    };
+    if (old?.id) out.id = old.id;
+    return out;
+  });
+}
+
 export class UptimeKumaClient {
   private socket: Socket | null = null;
   private session: KumaSession | null = null;
@@ -216,7 +239,7 @@ export class UptimeKumaClient {
       const tokenRes = await this.emitWithAck('loginByToken', this.session.token);
       if (tokenRes?.ok) {
         this.session.obtainedAt = Date.now();
-        if (this.socket === sock) this.authed = true;
+        if (this.socket === sock && sock.connected) this.authed = true;
         return;
       }
       this.session = null; // rejected (expired / Kuma restarted with a new secret): fall back to password
@@ -238,7 +261,8 @@ export class UptimeKumaClient {
       token: res.token,
       obtainedAt: Date.now(),
     };
-    // Ignore a login that completed on a socket that has since been replaced or dropped.
+    // Keep the token either way, but only mark THIS connection authenticated if `sock` is still the
+    // current, connected socket; a login that finished after a drop or replacement must not vouch for it.
     if (this.socket === sock && sock.connected) this.authed = true;
   }
 
@@ -742,17 +766,48 @@ export class UptimeKumaClient {
     slug: string,
     changes: { title?: string; description?: string; theme?: string; footerText?: string; showPoweredBy?: boolean; showTags?: boolean; autoRefreshInterval?: number },
     groups: Array<{ name: string; monitorIds: number[] }>,
+    opts: { confirmPublic?: boolean } = {},
   ): Promise<any> {
     await this.ensureConnected();
     const cur = await this.request('getStatusPage', slug);
     if (!cur?.ok || !cur.config) throw new Error(`[${this.cfg.name}] status page '${slug}' not found`);
+    if (cur.config.published && !opts.confirmPublic) {
+      throw new Error(
+        `[${this.cfg.name}] status page '${slug}' is published: saving puts the listed monitors' names (and URLs, if shown) ` +
+        `on a public page. Re-run with confirmPublic=true to proceed.`);
+    }
+    // Kuma replaces groups wholesale; load the current ones so group ids and per-monitor sendUrl/url survive.
+    const existing = await this.fetchPublicGroups(slug);
     const config: Record<string, any> = { ...cur.config };
     for (const [k, v] of Object.entries(changes)) if (v !== undefined) config[k] = v;
     config.slug = slug;
-    const publicGroupList = groups.map((g) => ({ name: g.name, monitorList: g.monitorIds.map((id) => ({ id })) }));
+    const publicGroupList = mergeGroups(existing, groups);
     const res = await this.request('saveStatusPage', slug, config, config.icon ?? '', publicGroupList);
     if (!res?.ok) throw new Error(`[${this.cfg.name}] save status page failed: ${safeFailureText(res)}`);
     return { ok: true, slug };
+  }
+
+  /** Current public group list of a status page (Kuma serves it over HTTP, not Socket.IO). Fails closed. */
+  protected async fetchPublicGroups(slug: string): Promise<any[]> {
+    const url = new URL(`/api/status-page/${encodeURIComponent(slug)}`, this.cfg.baseUrl);
+    const mod = await import(url.protocol === 'https:' ? 'node:https' : 'node:http');
+    const body = await new Promise<string>((resolve, reject) => {
+      const req = mod.get(url, { timeout: 10_000, rejectUnauthorized: !this.cfg.insecureTLS } as any, (res: any) => {
+        if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode}`)); }
+        let data = ''; res.setEncoding('utf8');
+        res.on('data', (c: string) => { data += c; if (data.length > 5_000_000) req.destroy(new Error('response too large')); });
+        res.on('end', () => resolve(data));
+      });
+      req.on('timeout', () => req.destroy(new Error('timeout')));
+      req.on('error', reject);
+    }).catch((e: any) => { throw new Error(`[${this.cfg.name}] cannot load current groups of '${slug}' (${e?.message}); refusing to overwrite them`); });
+    try {
+      const list = JSON.parse(body)?.publicGroupList;
+      if (!Array.isArray(list)) throw new Error('no publicGroupList');
+      return list;
+    } catch {
+      throw new Error(`[${this.cfg.name}] cannot parse current groups of '${slug}'; refusing to overwrite them`);
+    }
   }
 
   async deleteStatusPage(slug: string): Promise<any> {

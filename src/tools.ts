@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { getClient, allInstanceNames } from './instances.js';
 import { MONITOR_TYPES } from './types.js';
 import { scrubUrlField } from './redact.js';
+import { allowWriteMethods, SAFE_METHODS, WRITE_METHODS } from './policy.js';
 
 /**
  * Build an instance selector enum from the configured instance names.
@@ -26,11 +27,14 @@ const Instance = instanceSchema();
 
 // ── Shared monitor field schema (add + edit) ────────────────────
 
+const METHODS = (allowWriteMethods() ? [...SAFE_METHODS, ...WRITE_METHODS] : [...SAFE_METHODS]) as [string, ...string[]];
+
 const monitorFields = {
-  url:                z.string().optional().describe('URL to monitor (http/keyword types)'),
+  url:                z.string().optional().describe('URL to monitor (http/keyword types). Loopback, link-local, gateway/MCP hosts and KUMA_MCP_DENY_HOSTS entries are refused.'),
   hostname:           z.string().optional().describe('Hostname for ping/port/dns types'),
   port:               z.number().int().optional().describe('Port number'),
-  method:             z.string().optional().describe('HTTP method (GET, POST, ...)'),
+  method:             z.enum(METHODS).optional().describe(
+    allowWriteMethods() ? 'HTTP method' : 'HTTP method: GET or HEAD only (the operator can enable others with KUMA_MCP_ALLOW_WRITE_METHODS=1)'),
   interval:           z.number().int().positive().optional().describe('Check interval in seconds (default 60)'),
   retryInterval:      z.number().int().optional().describe('Retry interval in seconds (default 60)'),
   resendInterval:     z.number().int().min(0).optional().describe('Resend notification every N checks while down (0 = off)'),
@@ -51,7 +55,7 @@ const monitorFields = {
   docker_host:        z.number().int().nullable().optional().describe('Numeric ID of the Docker host (docker type)'),
   docker_container:   z.string().optional().describe('Container name (docker type)'),
   headers:            z.union([z.string(), z.record(z.string())]).optional().describe('HTTP headers as a JSON object or JSON string. Treated as a credential: never echoed.'),
-  body:               z.union([z.string(), z.record(z.any())]).optional().describe('HTTP request body (JSON object or string). Never echoed.'),
+  body:               z.union([z.string(), z.record(z.any())]).optional().describe('HTTP request body (JSON object or string). Refused unless the operator sets KUMA_MCP_ALLOW_WRITE_METHODS=1. Never echoed.'),
   authMethod:         z.enum(['basic', 'ntlm', 'mtls', 'oauth2-cc']).nullable().optional().describe('HTTP authentication method (null = none)'),
   basic_auth_user:    z.string().optional().describe('Basic-auth username. Never echoed.'),
   basic_auth_pass:    z.string().optional().describe('Basic-auth password. Accepted, never echoed.'),
@@ -454,9 +458,18 @@ export const toolDefs: ToolDef[] = [
       cron:           z.string().optional().describe('Cron expression (cron strategy)'),
       durationMinutes: z.number().int().positive().optional().default(60).describe('Window length in minutes (cron strategy)'),
       timezoneOption: z.string().optional().default('UTC').describe('IANA timezone, or "SAME_AS_SERVER"'),
+      confirmOpenEnded: z.boolean().optional().describe('Required for a "manual" window (active, suppressing alerts, until someone pauses it) when it covers more than 5 monitors or has no end time in dateRange'),
     }),
     handler: async (args) => {
-      const { instance, monitorIds, ...rest } = args;
+      const { instance, monitorIds, confirmOpenEnded, ...rest } = args;
+      if (rest.strategy === 'manual') {
+        const hasEnd = !!rest.dateRange?.[1];
+        if ((monitorIds.length > 5 || !hasEnd) && confirmOpenEnded !== true) {
+          throw new Error(
+            'a manual maintenance window silences alerts until someone pauses it: pass confirmOpenEnded=true ' +
+            '(required when it covers more than 5 monitors or has no end time)');
+        }
+      }
       const maintenance = {
         ...rest,
         dateRange: rest.dateRange ?? [null, null],
@@ -479,9 +492,16 @@ export const toolDefs: ToolDef[] = [
   },
   {
     name: 'uptimekuma_delete_maintenance',
-    description: 'Permanently delete a maintenance window. This cannot be undone.',
-    schema: z.object({ instance: Instance, maintenanceId: z.number().int().positive() }),
-    handler: async (args) => getClient(args.instance).deleteMaintenance(args.maintenanceId),
+    description: 'Permanently delete a maintenance window. This cannot be undone. confirmId must equal maintenanceId.',
+    schema: z.object({
+      instance: Instance,
+      maintenanceId: z.number().int().positive(),
+      confirmId: z.number().int().describe('Repeat maintenanceId to confirm the deletion'),
+    }),
+    handler: async (args) => {
+      if (args.confirmId !== args.maintenanceId) throw new Error('confirmId must equal maintenanceId to delete');
+      return getClient(args.instance).deleteMaintenance(args.maintenanceId);
+    },
   },
 
   // ── Status pages ─────────────────────────────────────────────────
@@ -500,7 +520,9 @@ export const toolDefs: ToolDef[] = [
     name: 'uptimekuma_save_status_page',
     description:
       'Save a status page. WARNING: Kuma replaces the whole group list, so `groups` is the COMPLETE desired list ' +
-      '(an empty array removes all groups). Page settings you omit are preserved.',
+      '(an empty array removes all groups); existing group ids and per-monitor sendUrl/url settings are carried over. ' +
+      'Page settings you omit are preserved. PUBLIC EXPOSURE: a published status page is visible to anyone who can reach ' +
+      'Kuma, and lists monitor names (and URLs where shown). For a published page you must pass confirmPublic=true.',
     schema: z.object({
       instance:    Instance,
       slug:        z.string().min(1),
@@ -515,16 +537,24 @@ export const toolDefs: ToolDef[] = [
         name:       z.string().min(1),
         monitorIds: z.array(z.number().int().positive()),
       })).describe('Complete list of monitor groups for the page'),
+      confirmPublic: z.boolean().optional().describe('Required when the page is published (publicly visible)'),
     }),
     handler: async (args) => {
-      const { instance, slug, groups, ...changes } = args;
-      return getClient(instance).saveStatusPage(slug, changes, groups);
+      const { instance, slug, groups, confirmPublic, ...changes } = args;
+      return getClient(instance).saveStatusPage(slug, changes, groups, { confirmPublic });
     },
   },
   {
     name: 'uptimekuma_delete_status_page',
-    description: 'Permanently delete a status page by slug. This cannot be undone.',
-    schema: z.object({ instance: Instance, slug: z.string().min(1) }),
-    handler: async (args) => getClient(args.instance).deleteStatusPage(args.slug),
+    description: 'Permanently delete a status page by slug. This cannot be undone. confirmSlug must equal slug.',
+    schema: z.object({
+      instance: Instance,
+      slug: z.string().min(1),
+      confirmSlug: z.string().describe('Repeat slug to confirm the deletion'),
+    }),
+    handler: async (args) => {
+      if (args.confirmSlug !== args.slug) throw new Error('confirmSlug must equal slug to delete');
+      return getClient(args.instance).deleteStatusPage(args.slug);
+    },
   },
 ];

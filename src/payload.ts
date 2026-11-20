@@ -1,4 +1,5 @@
 import { createHash, randomInt } from 'node:crypto';
+import { assertMethodAndBodyAllowed, assertTargetAllowed } from './policy.js';
 
 /**
  * Monitor payload construction for Kuma's `add` / `editMonitor` socket events.
@@ -109,7 +110,18 @@ export function normalizeStatusCodes(v: unknown): string[] | undefined {
   if (v === undefined || v === null) return undefined;
   const arr = Array.isArray(v) ? v : String(v).split(',');
   const out = arr.map((s) => String(s).trim()).filter((s) => s.length > 0);
-  return out.length > 0 ? out : undefined;
+  // An explicit but empty value must not silently become a default (it would mask a caller error).
+  if (out.length === 0) throw new Error('accepted_statuscodes must contain at least one status code or range');
+  return out;
+}
+
+/** Keys a caller can never set: the token is server-generated, active/ownership are not tool-controlled. */
+const FORBIDDEN_INPUT_KEYS = ['pushToken', 'active', 'user_id', 'id'];
+
+function sanitizeInput(opts: Record<string, any>): Record<string, any> {
+  const out = { ...opts };
+  for (const k of FORBIDDEN_INPUT_KEYS) delete out[k];
+  return out;
 }
 
 /** Copy `changes` onto `target`, skipping undefined and skipping null for non-nullable columns. */
@@ -126,7 +138,6 @@ function normalizeCommon(m: Record<string, any>): void {
   m.accepted_statuscodes = sc ?? ['200-299'];
   if ('headers' in m) m.headers = toJsonString(m.headers);
   if ('body' in m) m.body = toJsonString(m.body);
-  if (m.type === 'push' && !m.pushToken) m.pushToken = genPushToken();
   if (m.parent === undefined) m.parent = null;
 }
 
@@ -134,13 +145,18 @@ function normalizeCommon(m: Record<string, any>): void {
  * Build the complete payload for `add`. Every NOT NULL column gets the UI default; a
  * caller value of undefined (or null for a non-nullable column) never overrides it.
  */
-export function buildAddPayload(opts: Record<string, any>): Record<string, any> {
+export function buildAddPayload(rawOpts: Record<string, any>): Record<string, any> {
+  const opts = sanitizeInput(rawOpts);
+  assertMethodAndBodyAllowed(opts);
+  assertTargetAllowed(opts);
   const m = monitorDefaults();
   applyChanges(m, opts);
   if (opts.timeout === undefined || opts.timeout === null || opts.timeout === 0) {
     m.timeout = deriveTimeout(m.type, m.interval);
   }
   normalizeCommon(m);
+  // Tokens are generated only here, on creation (never on edit: an edit must not replace a live token).
+  if (m.type === 'push') m.pushToken = genPushToken();
   return m;
 }
 
@@ -152,9 +168,11 @@ export function buildAddPayload(opts: Record<string, any>): Record<string, any> 
  */
 export function buildEditPayload(
   current: Record<string, any>,
-  changes: Record<string, any>,
+  rawChanges: Record<string, any>,
   monitorId: number,
 ): Record<string, any> {
+  const changes = sanitizeInput(rawChanges);
+  assertMethodAndBodyAllowed(changes);
   const m: Record<string, any> = { ...current };
   for (const k of READ_ONLY_KEYS) delete m[k];
   // Fill NOT NULL columns the server did not return (older/newer Kuma schema differences).
@@ -165,6 +183,14 @@ export function buildEditPayload(
   const oldInterval = current.interval;
   const oldDerived = deriveTimeout(current.type, oldInterval);
   applyChanges(m, changes);
+  // Re-check the effective target when anything that shapes it changed.
+  if (changes.url !== undefined || changes.hostname !== undefined || changes.port !== undefined) {
+    assertTargetAllowed({
+      url: changes.url,
+      hostname: changes.hostname ?? (changes.port !== undefined ? m.hostname : undefined),
+      port: m.port,
+    });
+  }
   m.id = monitorId;
   if (!m.timeout) {
     m.timeout = deriveTimeout(m.type, m.interval);
@@ -175,5 +201,9 @@ export function buildEditPayload(
     m.timeout = deriveTimeout(m.type, m.interval);
   }
   normalizeCommon(m);
+  // Tokens are generated only in buildAddPayload. An edit must never invent or replace a live token.
+  if (m.type === 'push' && !m.pushToken) {
+    throw new Error('push monitor has no push token; refusing to edit (repair it in the Kuma UI)');
+  }
   return m;
 }

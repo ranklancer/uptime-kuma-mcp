@@ -374,7 +374,7 @@ export const MONITOR_DESTINATION_FIELDS: readonly string[] = [
 /** Edit keys that cannot redirect a credential; allowed even when the monitor holds credentials. */
 const MONITOR_EDIT_SAFE_KEYS = new Set([
   'name', 'description', 'interval', 'retryInterval', 'resendInterval', 'maxretries', 'timeout', 'keyword',
-  'invertKeyword', 'accepted_statuscodes', 'parent', 'notificationIDList', 'upsideDown', 'weight', 'expiryNotification',
+  'invertKeyword', 'accepted_statuscodes', 'parent', 'notificationIDList', 'weight', 'expiryNotification',
 ]);
 
 export const DESTINATION_REFUSAL = 'monitor holds credentials; destination change needs an operator';

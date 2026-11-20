@@ -158,14 +158,14 @@ test('add payload: accepted_statuscodes accepts array and comma string; always s
   assert.deepEqual(buildAddPayload({ name: 'x', accepted_statuscodes: ['200-299', '301'] }).accepted_statuscodes, ['200-299', '301']);
   assert.deepEqual(buildAddPayload({ name: 'x', accepted_statuscodes: '200-299, 404' }).accepted_statuscodes, ['200-299', '404']);
   assert.deepEqual(buildAddPayload({ name: 'x', accepted_statuscodes: [200, 301] as any }).accepted_statuscodes, ['200', '301']);
-  assert.deepEqual(buildAddPayload({ name: 'x', accepted_statuscodes: [] }).accepted_statuscodes, ['200-299']);
+  assert.throws(() => buildAddPayload({ name: 'x', accepted_statuscodes: [] }), /at least one/);
+  assert.throws(() => buildAddPayload({ name: 'x', accepted_statuscodes: ' , ' }), /at least one/);
   assert.equal(normalizeStatusCodes(undefined), undefined);
 });
 
 test('add payload: headers/body objects become JSON strings; auth + docker + parent pass through', () => {
-  const p = buildAddPayload({ name: 'x', headers: { A: 'b' }, body: { k: 1 }, authMethod: 'basic', basic_auth_user: 'u', docker_host: 2, docker_container: 'c', parent: 7 });
+  const p = buildAddPayload({ name: 'x', headers: { A: 'b' }, authMethod: 'basic', basic_auth_user: 'u', docker_host: 2, docker_container: 'c', parent: 7 });
   assert.equal(p.headers, '{"A":"b"}');
-  assert.equal(p.body, '{"k":1}');
   assert.equal(p.authMethod, 'basic');
   assert.equal(p.docker_host, 2);
   assert.equal(p.parent, 7);
@@ -248,8 +248,9 @@ test('edit merge: auto-derived timeout follows an interval change; custom or exp
   assert.equal(buildEditPayload({ ...current, timeout: 0 }, {}, 5).timeout, 48); // zeroed timeout repaired like the UI
 });
 
-test('edit merge: switching a monitor to push generates a token; existing token is kept', () => {
-  assert.match(buildEditPayload(current, { type: 'push' }, 5).pushToken, /^[A-Za-z0-9]{32}$/);
+test('edit merge: existing push token is kept; a push monitor with no token is refused (never generated on edit)', () => {
+  assert.throws(() => buildEditPayload(current, { type: 'push' }, 5), /no push token/);
+  assert.throws(() => buildEditPayload({ ...current, type: 'push', pushToken: '' }, { name: 'n' }, 5), /no push token/);
   assert.equal(buildEditPayload({ ...current, type: 'push', pushToken: 'EXISTINGTOKEN' }, { name: 'n' }, 5).pushToken, 'EXISTINGTOKEN');
 });
 
@@ -273,7 +274,8 @@ test('editMonitor end to end: loads current via getMonitor, emits editMonitor wi
 
 // ── 4. new tools hit the right Kuma events ──────────────────────────────────
 test('tag / maintenance / status page methods emit the expected Kuma events and args', async () => {
-  const { client, sent } = addClient({ ok: true, maintenanceID: 4, config: { slug: 's', title: 'T', icon: '/i.png', domainNameList: [] } });
+  const { client, sent } = addClient({ ok: true, maintenanceID: 4, config: { slug: 's', title: 'T', icon: '/i.png', published: true, domainNameList: [] } });
+  client.fetchPublicGroups = async () => [];
   await client.createTag('t', '#112233');
   await client.addMonitorTag(1, 2, 'v');
   await client.removeMonitorTag(1, 2, 'v');
@@ -282,7 +284,7 @@ test('tag / maintenance / status page methods emit the expected Kuma events and 
   await client.resumeMaintenance(4);
   await client.deleteMaintenance(4);
   await client.addStatusPage('T', 's');
-  await client.saveStatusPage('s', { title: 'New' }, [{ name: 'g', monitorIds: [7] }]);
+  await client.saveStatusPage('s', { title: 'New' }, [{ name: 'g', monitorIds: [7] }], { confirmPublic: true });
   await client.deleteStatusPage('s');
   assert.deepEqual(sent.map((s) => s[0]), ['addTag', 'addMonitorTag', 'deleteMonitorTag', 'addMaintenance', 'addMonitorMaintenance',
     'pauseMaintenance', 'resumeMaintenance', 'deleteMaintenance', 'addStatusPage', 'getStatusPage', 'saveStatusPage', 'deleteStatusPage']);
