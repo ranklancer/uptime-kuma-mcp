@@ -30,9 +30,54 @@ const BUILTIN_DENY = [
   'host.docker.internal', 'metadata.google.internal', '*bifrost*', '*mcp*',
 ];
 
+/** Entry grammar: host/glob[:port], IPv4 or IPv6 CIDR, bare IPv6, or [IPv6][:port]. */
+function validEntry(e: string): boolean {
+  const c4 = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(e);
+  if (c4) return ipv4ToInt(c4[1]) !== null && Number(c4[2]) <= 32;
+  const c6 = /^([0-9a-f:.]*:[0-9a-f:.]*)\/(\d{1,3})$/i.exec(e);
+  if (c6) return ipv6ToBig(c6[1]) !== null && Number(c6[2]) <= 128;
+  const b6 = /^\[([0-9a-f:.]+)\](?::(\d{1,5}))?$/i.exec(e);
+  if (b6) return ipv6ToBig(b6[1]) !== null;
+  if ((e.match(/:/g) ?? []).length >= 2) return ipv6ToBig(e) !== null; // bare IPv6
+  return /^[a-z0-9_*.-]+(?::\d{1,5})?$/.test(e);
+}
+
+/**
+ * Built-ins plus KUMA_MCP_DENY_HOSTS. A malformed operator entry is REFUSED (an error on every
+ * add/edit) rather than skipped: a typo must not silently leave a target allowed.
+ */
 export function denyList(): string[] {
   const extra = (process.env.KUMA_MCP_DENY_HOSTS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  for (const e of extra) {
+    if (!validEntry(e)) throw new Error(`KUMA_MCP_DENY_HOSTS has an invalid entry "${e}"; fix the MCP server environment (IPv6 with a port needs brackets: [2001:db8::5]:8080)`);
+  }
   return [...BUILTIN_DENY, ...extra];
+}
+
+/** `https://` is the Kuma UI's placeholder url for non-HTTP monitors; it is not a target. */
+export function isPlaceholderUrl(u: unknown): boolean {
+  return typeof u !== 'string' || u.trim() === '' || u.trim() === 'https://';
+}
+
+/** Port the Kuma UI fills in when the monitor type has a conventional one and none was given. */
+export const UI_DEFAULT_PORTS: Record<string, number> = { dns: 53, radius: 1812, snmp: 161 };
+
+/** Types whose request target is `url` vs `hostname` (+port). Types in neither set have no network target in those fields. */
+export const URL_TYPES = ['http', 'keyword', 'json-query', 'real-browser'];
+export const HOST_TYPES = ['port', 'ping', 'dns', 'tailscale-ping', 'smtp', 'snmp', 'steam', 'gamedig', 'mqtt', 'radius'];
+const NO_TARGET_TYPES = ['group', 'push', 'docker', 'manual'];
+
+/** The fields of a (merged) monitor that actually make the outgoing request for its type. Unknown types: check both. */
+export function effectiveTarget(m: Record<string, any>): { url?: unknown; hostname?: unknown; port?: unknown; dns_resolve_server?: unknown } {
+  const t = String(m.type ?? '');
+  if (NO_TARGET_TYPES.includes(t)) return {};
+  const unknown = !URL_TYPES.includes(t) && !HOST_TYPES.includes(t);
+  return {
+    url: (URL_TYPES.includes(t) || unknown) && !isPlaceholderUrl(m.url) ? m.url : undefined,
+    hostname: HOST_TYPES.includes(t) || unknown ? m.hostname : undefined,
+    port: HOST_TYPES.includes(t) || unknown ? m.port : undefined,
+    dns_resolve_server: t === 'dns' ? m.dns_resolve_server : undefined,
+  };
 }
 
 export function assertMethodAndBodyAllowed(f: { method?: unknown; body?: unknown }): void {
@@ -121,8 +166,16 @@ function entryMatches(entry: string, host: string, port: string): boolean {
     return ((ip & mask) >>> 0) === ((base & mask) >>> 0);
   }
   let pat = entry, wantPort: string | null = null;
-  const pm = /^([^:]+):(\d+)$/.exec(entry); // single colon only: IPv6 entries are not host:port
-  if (pm) { pat = pm[1]; wantPort = pm[2]; }
+  const b6 = /^\[([0-9a-f:.]+)\](?::(\d+))?$/i.exec(entry); // [2001:db8::5]:8080 or [2001:db8::5]
+  const pm = /^([^:]+):(\d+)$/.exec(entry); // single colon only: bare IPv6 entries are not host:port
+  if (b6) { pat = b6[1]; wantPort = b6[2] ?? null; }
+  else if (pm) { pat = pm[1]; wantPort = pm[2]; }
+  // IPv6 entries compare numerically so 2001:0db8::5 and 2001:db8::5 are the same host.
+  const pBig = pat.includes(':') ? ipv6ToBig(pat) : null;
+  if (pBig !== null) {
+    const hBig = ipv6ToBig(host);
+    return hBig !== null && hBig === pBig && (wantPort === null || wantPort === port);
+  }
   const re = new RegExp('^' + pat.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
   if (!re.test(host)) return false;
   return wantPort === null || wantPort === port;

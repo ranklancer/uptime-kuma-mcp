@@ -359,3 +359,50 @@ test('R3-6 repeated trailing dots and IPv4-translated IPv6 forms are normalised 
   assert.throws(() => assertTargetAllowed({ hostname: 'localhost..' }), /not allowed/);
   assert.doesNotThrow(() => assertTargetAllowed({ url: 'http://example.test../' }));
 });
+
+// ── Round 4 ─────────────────────────────────────────────────────────────────
+test('R4-1 IPv6 bracket host:port deny entries match URL and hostname+port forms', () => {
+  process.env.KUMA_MCP_DENY_HOSTS = '[2001:db8::5]:8080, [2001:db8::6], 2001:db8::7, 2001:db9::/32';
+  try {
+    assert.throws(() => assertTargetAllowed({ url: 'http://[2001:db8::5]:8080/' }), /not allowed/);
+    assert.throws(() => assertTargetAllowed({ url: 'http://[2001:0db8:0:0:0:0:0:5]:8080/' }), /not allowed/);
+    assert.throws(() => assertTargetAllowed({ hostname: '2001:db8::5', port: 8080 }), /not allowed/);
+    assert.doesNotThrow(() => assertTargetAllowed({ url: 'http://[2001:db8::5]:9090/' }));
+    assert.doesNotThrow(() => assertTargetAllowed({ hostname: '2001:db8::5' }));
+    assert.throws(() => assertTargetAllowed({ url: 'http://[2001:db8::6]:1/' }), /not allowed/); // no port = any port
+    assert.throws(() => assertTargetAllowed({ hostname: '2001:db8::7' }), /not allowed/);       // bare IPv6 entry
+    assert.throws(() => assertTargetAllowed({ hostname: '2001:db9::1' }), /not allowed/);       // v6 CIDR
+  } finally { delete process.env.KUMA_MCP_DENY_HOSTS; }
+});
+
+test('R4-1b a malformed KUMA_MCP_DENY_HOSTS entry is refused loudly, not skipped', () => {
+  for (const bad of ['2001:db8::5:8080:zz', 'a b', '10.0.0.0/99', '[zz]:80', 'http://x']) {
+    process.env.KUMA_MCP_DENY_HOSTS = 'ok.example.test,' + bad;
+    try { assert.throws(() => assertTargetAllowed({ hostname: 'example.test' }), /invalid entry/, bad); } finally { delete process.env.KUMA_MCP_DENY_HOSTS; }
+  }
+});
+
+test('R4-2 merged target check follows the monitor type: stale unrelated fields do not cause refusals', () => {
+  const ping = { ...cur, type: 'ping', url: 'http://localhost/', hostname: 'nas.example.test', port: null };
+  assert.doesNotThrow(() => buildEditPayload(ping, { hostname: 'nas2.example.test' }, 5));
+  const http = { ...cur, type: 'http', url: 'https://a.example.test/', hostname: 'localhost' };
+  assert.doesNotThrow(() => buildEditPayload(http, { url: 'https://b.example.test/' }, 5));
+  // but the relevant field is still enforced
+  assert.throws(() => buildEditPayload({ ...ping, hostname: 'localhost' }, { ignoreTls: true }, 5), /not allowed/);
+  assert.throws(() => buildEditPayload({ ...http, url: 'http://localhost/' }, { ignoreTls: true }, 5), /not allowed/);
+  assert.throws(() => buildEditPayload({ ...cur, type: 'weird-new-type', hostname: 'localhost' }, { ignoreTls: true }, 5), /not allowed/); // unknown type: both checked
+});
+
+test('R4-3 the https:// placeholder url is accepted on add and edit (ping/port)', () => {
+  assert.doesNotThrow(() => buildAddPayload({ name: 'p', type: 'ping', hostname: 'nas.example.test', url: 'https://' }));
+  assert.doesNotThrow(() => buildAddPayload({ name: 'p', type: 'port', hostname: 'nas.example.test', port: 22, url: 'https://' }));
+  assert.doesNotThrow(() => buildEditPayload({ ...cur, type: 'port', hostname: 'a.example.test' }, { url: 'https://', port: 22 }, 5));
+  assert.throws(() => buildAddPayload({ name: 'p', type: 'ping', hostname: 'localhost', url: 'https://' }), /not allowed/);
+});
+
+test('R4-4 UI default ports are filled for dns/radius/snmp and used by the denylist', () => {
+  assert.equal(buildAddPayload({ name: 'd', type: 'dns', hostname: 'a.example.test' }).port, 53);
+  assert.equal(buildAddPayload({ name: 'd', type: 'dns', hostname: 'a.example.test', port: 5353 }).port, 5353);
+  process.env.KUMA_MCP_DENY_HOSTS = 'dns.internal:53';
+  try { assert.throws(() => buildAddPayload({ name: 'd', type: 'dns', hostname: 'dns.internal' }), /not allowed/); } finally { delete process.env.KUMA_MCP_DENY_HOSTS; }
+});

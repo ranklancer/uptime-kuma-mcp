@@ -1,5 +1,5 @@
 import { createHash, randomInt } from 'node:crypto';
-import { allowWriteMethods, assertMethodAndBodyAllowed, assertTargetAllowed, MAX_REDIRECTS_SAFE } from './policy.js';
+import { allowWriteMethods, assertMethodAndBodyAllowed, assertTargetAllowed, effectiveTarget, isPlaceholderUrl, MAX_REDIRECTS_SAFE, UI_DEFAULT_PORTS } from './policy.js';
 
 /**
  * Monitor payload construction for Kuma's `add` / `editMonitor` socket events.
@@ -148,10 +148,15 @@ function normalizeCommon(m: Record<string, any>): void {
 export function buildAddPayload(rawOpts: Record<string, any>): Record<string, any> {
   const opts = sanitizeInput(rawOpts);
   assertMethodAndBodyAllowed(opts);
-  assertTargetAllowed(opts);
+  assertTargetAllowed({
+    ...opts,
+    url: isPlaceholderUrl(opts.url) ? undefined : opts.url, // a ping/port add may carry the UI placeholder
+    port: opts.port ?? UI_DEFAULT_PORTS[String(opts.type ?? '')],
+  });
   const m = monitorDefaults();
   if (!allowWriteMethods()) m.maxredirects = 0; // default off; callers may raise it to the cap
   applyChanges(m, opts);
+  if ((m.port === undefined || m.port === null) && UI_DEFAULT_PORTS[m.type]) m.port = UI_DEFAULT_PORTS[m.type]; // as the UI does
   if (!allowWriteMethods()) m.maxredirects = Math.min(Number(m.maxredirects) || 0, MAX_REDIRECTS_SAFE);
   if (opts.timeout === undefined || opts.timeout === null || opts.timeout === 0) {
     m.timeout = deriveTimeout(m.type, m.interval);
@@ -194,7 +199,7 @@ export function buildEditPayloadWithNotes(
   // Re-check the effective target when anything that shapes it changed.
   if (changes.url !== undefined || changes.hostname !== undefined || changes.port !== undefined || changes.dns_resolve_server !== undefined) {
     assertTargetAllowed({
-      url: changes.url,
+      url: isPlaceholderUrl(changes.url) ? undefined : changes.url,
       hostname: changes.hostname ?? (changes.port !== undefined ? m.hostname : undefined),
       port: m.port,
       dns_resolve_server: changes.dns_resolve_server,
@@ -206,13 +211,7 @@ export function buildEditPayloadWithNotes(
     'authMethod', 'basic_auth_user', 'basic_auth_pass', 'ignoreTls'];
   if (!allowWriteMethods() && shaping.some((k) => changes[k] !== undefined)) {
     assertMethodAndBodyAllowed(m);
-    // The monitor's EFFECTIVE target must be allowed too (a monitor already aimed at a denied host cannot be tweaked).
-    assertTargetAllowed({
-      url: typeof m.url === 'string' && m.url.trim() !== '' && m.url.trim() !== 'https://' ? m.url : undefined, // 'https://' is the UI placeholder
-      hostname: m.hostname,
-      port: m.port,
-      dns_resolve_server: m.type === 'dns' ? m.dns_resolve_server : undefined,
-    });
+      assertTargetAllowed(effectiveTarget(m));
     const before = Number(m.maxredirects) || 0;
     m.maxredirects = Math.min(before, MAX_REDIRECTS_SAFE);
     if (m.maxredirects !== before) {
