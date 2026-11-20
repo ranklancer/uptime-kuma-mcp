@@ -1,5 +1,5 @@
 import { createHash, randomInt } from 'node:crypto';
-import { assertMethodAndBodyAllowed, assertTargetAllowed } from './policy.js';
+import { allowWriteMethods, assertMethodAndBodyAllowed, assertTargetAllowed, MAX_REDIRECTS_SAFE } from './policy.js';
 
 /**
  * Monitor payload construction for Kuma's `add` / `editMonitor` socket events.
@@ -150,7 +150,9 @@ export function buildAddPayload(rawOpts: Record<string, any>): Record<string, an
   assertMethodAndBodyAllowed(opts);
   assertTargetAllowed(opts);
   const m = monitorDefaults();
+  if (!allowWriteMethods()) m.maxredirects = 0; // default off; callers may raise it to the cap
   applyChanges(m, opts);
+  if (!allowWriteMethods()) m.maxredirects = Math.min(Number(m.maxredirects) || 0, MAX_REDIRECTS_SAFE);
   if (opts.timeout === undefined || opts.timeout === null || opts.timeout === 0) {
     m.timeout = deriveTimeout(m.type, m.interval);
   }
@@ -184,12 +186,20 @@ export function buildEditPayload(
   const oldDerived = deriveTimeout(current.type, oldInterval);
   applyChanges(m, changes);
   // Re-check the effective target when anything that shapes it changed.
-  if (changes.url !== undefined || changes.hostname !== undefined || changes.port !== undefined) {
+  if (changes.url !== undefined || changes.hostname !== undefined || changes.port !== undefined || changes.dns_resolve_server !== undefined) {
     assertTargetAllowed({
       url: changes.url,
       hostname: changes.hostname ?? (changes.port !== undefined ? m.hostname : undefined),
       port: m.port,
+      dns_resolve_server: changes.dns_resolve_server,
     });
+  }
+  // B1: the incoming-only check above misses an EXISTING POST/body monitor whose target is being changed.
+  // Re-check the merged result whenever anything that shapes the outgoing request changed (N1: also cap redirects).
+  const shaping = ['url', 'hostname', 'port', 'type', 'method', 'body', 'headers', 'maxredirects', 'dns_resolve_server'];
+  if (!allowWriteMethods() && shaping.some((k) => changes[k] !== undefined)) {
+    assertMethodAndBodyAllowed(m);
+    m.maxredirects = Math.min(Number(m.maxredirects) || 0, MAX_REDIRECTS_SAFE);
   }
   m.id = monitorId;
   if (!m.timeout) {

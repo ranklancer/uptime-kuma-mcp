@@ -282,12 +282,16 @@ export const toolDefs: ToolDef[] = [
   },
   {
     name: 'uptimekuma_delete_monitor',
-    description: 'Permanently delete a monitor by ID. This cannot be undone.',
+    description: 'Permanently delete a monitor by ID. This cannot be undone. confirmId must equal monitorId.',
     schema: z.object({
       instance:  Instance,
       monitorId: z.number().int().positive().describe('The numeric ID of the monitor to delete'),
+      confirmId: z.number().int().describe('Repeat monitorId to confirm the deletion'),
     }),
-    handler: async (args) => getClient(args.instance).deleteMonitor(args.monitorId),
+    handler: async (args) => {
+      if (args.confirmId !== args.monitorId) throw new Error('confirmId must equal monitorId to delete');
+      return getClient(args.instance).deleteMonitor(args.monitorId);
+    },
   },
   {
     name: 'uptimekuma_pause_monitor',
@@ -356,12 +360,16 @@ export const toolDefs: ToolDef[] = [
   },
   {
     name: 'uptimekuma_delete_notification',
-    description: 'Permanently delete a notification provider by ID. This cannot be undone.',
+    description: 'Permanently delete a notification provider by ID. This cannot be undone. confirmId must equal notificationId.',
     schema: z.object({
       instance:       Instance,
       notificationId: z.number().int().positive().describe('The numeric ID of the notification provider to delete'),
+      confirmId:      z.number().int().describe('Repeat notificationId to confirm the deletion'),
     }),
-    handler: async (args) => getClient(args.instance).deleteNotification(args.notificationId),
+    handler: async (args) => {
+      if (args.confirmId !== args.notificationId) throw new Error('confirmId must equal notificationId to delete');
+      return getClient(args.instance).deleteNotification(args.notificationId);
+    },
   },
   {
     name: 'uptimekuma_set_monitor_notifications',

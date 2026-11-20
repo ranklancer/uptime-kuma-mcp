@@ -25,7 +25,8 @@ export function allowWriteMethods(): boolean {
 }
 
 const BUILTIN_DENY = [
-  'localhost', '*.localhost', '127.0.0.0/8', '::1', '0.0.0.0', '169.254.0.0/16', '::',
+  'localhost', '*.localhost', '127.0.0.0/8', '0.0.0.0/8', '::1', '::', '169.254.0.0/16',
+  'fe80::/10', 'fc00::/7', '::/96', '64:ff9b::/96', // link-local, ULA, IPv4-compatible (::127.0.0.1), NAT64
   'host.docker.internal', 'metadata.google.internal', '*bifrost*', '*mcp*',
 ];
 
@@ -53,11 +54,17 @@ function ipv4ToInt(h: string): number | null {
 }
 
 /** Normalise a url or bare host the way an HTTP client would (decimal/hex IPs, IPv4-mapped IPv6, case, trailing dot). */
+/** Only these URL schemes may be monitored targets (N3). */
+const ALLOWED_SCHEMES = ['http', 'https', 'ws', 'wss'];
+
 function parseTarget(raw: string): { host: string; port: string } | null {
-  const s = raw.trim();
+  let s = raw.trim();
   if (!s) return null;
+  if ((s.match(/:/g) ?? []).length >= 2 && /^[0-9a-f:.]+$/i.test(s)) s = `[${s}]`; // bare IPv6 literal
+  const sch = /^([a-z][a-z0-9+.-]*):(\/\/|(?!\d))/i.exec(s);
+  if (sch && !ALLOWED_SCHEMES.includes(sch[1].toLowerCase())) return null; // file:, gopher:, ftp:, javascript:, ...
   try {
-    const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : 'http://' + s);
+    const u = new URL(sch ? s : 'http://' + s);
     let host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
     const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
     if (mapped) {
@@ -70,7 +77,33 @@ function parseTarget(raw: string): { host: string; port: string } | null {
   }
 }
 
+/** Parse an IPv6 literal (no brackets) to a 128-bit BigInt, or null. Handles `::` and a trailing dotted quad. */
+function ipv6ToBig(h: string): bigint | null {
+  let s = h;
+  const v4 = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(s);
+  if (v4) {
+    const n = ipv4ToInt(v4[2]);
+    if (n === null) return null;
+    s = v4[1] + ((n >>> 16).toString(16)) + ':' + ((n & 0xffff).toString(16));
+  }
+  if (!/^[0-9a-f:]+$/i.test(s) || (s.match(/::/g) ?? []).length > 1) return null;
+  const [l, r] = s.split('::');
+  const left = l ? l.split(':') : [], right = r !== undefined && r ? r.split(':') : [];
+  const fill = s.includes('::') ? 8 - left.length - right.length : 0;
+  if (fill < 0 || (!s.includes('::') && left.length !== 8)) return null;
+  const groups = [...left, ...Array(fill).fill('0'), ...right];
+  if (groups.length !== 8 || groups.some((g) => g.length > 4)) return null;
+  return groups.reduce((a, g) => (a << 16n) | BigInt(parseInt(g || '0', 16)), 0n);
+}
+
 function entryMatches(entry: string, host: string, port: string): boolean {
+  const cidr6 = /^([0-9a-f:]*:[0-9a-f:.]*)\/(\d{1,3})$/i.exec(entry);
+  if (cidr6) {
+    const ip = ipv6ToBig(host), base = ipv6ToBig(cidr6[1]), bits = Number(cidr6[2]);
+    if (ip === null || base === null || bits > 128) return false;
+    const shift = BigInt(128 - bits);
+    return (ip >> shift) === (base >> shift);
+  }
   const cidr = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(entry);
   if (cidr) {
     const ip = ipv4ToInt(host), base = ipv4ToInt(cidr[1]), bits = Number(cidr[2]);
@@ -87,16 +120,19 @@ function entryMatches(entry: string, host: string, port: string): boolean {
 }
 
 /** Throw if url/hostname (optionally with port) hits the denylist or cannot be parsed (fail closed). */
-export function assertTargetAllowed(t: { url?: unknown; hostname?: unknown; port?: unknown }): void {
+export function assertTargetAllowed(t: { url?: unknown; hostname?: unknown; port?: unknown; dns_resolve_server?: unknown }): void {
   const deny = denyList();
   const port = t.port !== undefined && t.port !== null ? String(t.port) : '';
-  for (const raw of [t.url, t.hostname]) {
+  for (const raw of [t.url, t.hostname, t.dns_resolve_server]) {
     if (typeof raw !== 'string' || raw === '') continue;
     const p = parseTarget(raw);
-    if (!p) throw new Error('monitor target not allowed: unparseable url/hostname');
+    if (!p) throw new Error('monitor target not allowed: unparseable url/hostname or scheme not in http/https/ws/wss');
     const eff = p.port || port;
     if (deny.some((e) => entryMatches(e, p.host, eff))) {
       throw new Error('monitor target not allowed: host is on the denylist (loopback, link-local, gateway/MCP or KUMA_MCP_DENY_HOSTS)');
     }
   }
 }
+
+/** Redirect cap while write methods are disabled: a followed redirect is a second, unchecked target (N1). */
+export const MAX_REDIRECTS_SAFE = 2;

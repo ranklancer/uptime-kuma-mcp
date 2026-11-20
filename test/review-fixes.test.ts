@@ -225,3 +225,66 @@ test('F4 add_maintenance manual window needs confirmOpenEnded when large or with
   await am.handler(am.schema.parse({ title: 'c', strategy: 'cron', cron: '0 3 * * *', monitorIds: [1, 2, 3, 4, 5, 6, 7] })); // non-manual unaffected
   assert.equal(added, 3);
 });
+
+// ── Round 2: B1, N1-N5 ──────────────────────────────────────────────────────
+test('B1 existing POST/body monitor: a url-only (or host/port/type/headers) edit is refused when write methods are off', () => {
+  const post = { ...cur, method: 'POST', body: '{"x":1}' };
+  assert.throws(() => buildEditPayload(post, { url: 'https://other.example.test/' }, 5), /not allowed/);
+  assert.throws(() => buildEditPayload({ ...post, body: '' }, { url: 'https://other.example.test/' }, 5), /method not allowed/);
+  for (const ch of [{ hostname: 'h.example.test' }, { port: 8080 }, { type: 'keyword' }, { headers: '{}' }]) {
+    assert.throws(() => buildEditPayload({ ...post, body: '' }, ch, 5), /method not allowed/, JSON.stringify(ch));
+  }
+  // unrelated edits (rename) and GET monitors are unaffected
+  assert.doesNotThrow(() => buildEditPayload(post, { name: 'renamed' }, 5));
+  assert.doesNotThrow(() => buildEditPayload(cur, { url: 'https://other.example.test/' }, 5));
+  // operator opt-in lifts it
+  process.env.KUMA_MCP_ALLOW_WRITE_METHODS = '1';
+  try { assert.doesNotThrow(() => buildEditPayload(post, { url: 'https://other.example.test/' }, 5)); } finally { delete process.env.KUMA_MCP_ALLOW_WRITE_METHODS; }
+});
+
+test('N1 maxredirects: default 0 and capped at 2 on add; capped on edit when target/redirects change; opt-in restores', () => {
+  assert.equal(buildAddPayload({ name: 'x' }).maxredirects, 0);
+  assert.equal(buildAddPayload({ name: 'x', maxredirects: 10 }).maxredirects, 2);
+  assert.equal(buildAddPayload({ name: 'x', maxredirects: 1 }).maxredirects, 1);
+  const c = { ...cur, maxredirects: 10 };
+  assert.equal(buildEditPayload(c, { url: 'https://o.example.test/' }, 5).maxredirects, 2);
+  assert.equal(buildEditPayload(c, { maxredirects: 9 }, 5).maxredirects, 2);
+  assert.equal(buildEditPayload(c, { name: 'n' }, 5).maxredirects, 10); // untouched when nothing request-shaping changed
+  process.env.KUMA_MCP_ALLOW_WRITE_METHODS = '1';
+  try { assert.equal(buildAddPayload({ name: 'x', maxredirects: 10 }).maxredirects, 10); } finally { delete process.env.KUMA_MCP_ALLOW_WRITE_METHODS; }
+});
+
+test('N2 built-in denylist covers IPv6 link-local/ULA, IPv4-compatible, NAT64 and 0.0.0.0/8', () => {
+  const bad = ['http://[fe80::1]/', 'http://[febf::1]/', 'http://[fc00::1]/', 'http://[fd12:3456::1]/', 'http://[::127.0.0.1]/', 'http://[::7f00:1]/',
+    'http://[64:ff9b::7f00:1]/', 'http://[64:ff9b::a9fe:a9fe]/', 'http://0.1.2.3/', 'http://0.255.255.255/'];
+  for (const u of bad) assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, u);
+  for (const h of ['fe80::1', 'fd00::5', '64:ff9b::1']) assert.throws(() => assertTargetAllowed({ hostname: h }), /not allowed/, h);
+  for (const ok of ['http://[2001:db8::1]/', 'http://[2606:4700::1111]/', 'http://1.2.3.4/']) assert.doesNotThrow(() => assertTargetAllowed({ url: ok }), ok);
+  assert.doesNotThrow(() => assertTargetAllowed({ hostname: '2001:db8::1' }));
+});
+
+test('N3 only http/https/ws/wss schemes are accepted', () => {
+  for (const u of ['file:///etc/passwd', 'gopher://x.example.test/', 'ftp://x.example.test/', 'javascript:alert(1)', 'data:text/plain,x', 'dict://x.example.test:11211/', 'FILE:///x']) {
+    assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, u);
+  }
+  for (const u of ['http://x.example.test/', 'https://x.example.test/', 'ws://x.example.test/', 'WSS://x.example.test/', 'x.example.test:8080']) {
+    assert.doesNotThrow(() => assertTargetAllowed({ url: u }), u);
+  }
+  assert.throws(() => buildAddPayload({ name: 'x', url: 'gopher://x.example.test/' }), /not allowed/);
+  assert.throws(() => buildEditPayload(cur, { url: 'file:///etc/passwd' }, 5), /not allowed/);
+});
+
+test('N4 dns_resolve_server goes through the denylist on add and edit', () => {
+  assert.throws(() => buildAddPayload({ name: 'x', type: 'dns', hostname: 'a.example.test', dns_resolve_server: '127.0.0.1' }), /not allowed/);
+  assert.throws(() => buildAddPayload({ name: 'x', type: 'dns', hostname: 'a.example.test', dns_resolve_server: '169.254.169.254' }), /not allowed/);
+  assert.throws(() => buildEditPayload(cur, { dns_resolve_server: 'localhost' }, 5), /not allowed/);
+  assert.doesNotThrow(() => buildAddPayload({ name: 'x', type: 'dns', hostname: 'a.example.test', dns_resolve_server: '1.1.1.1' }));
+});
+
+test('N5 delete_monitor / delete_notification require a matching confirmId', async () => {
+  for (const [name, key] of [['uptimekuma_delete_monitor', 'monitorId'], ['uptimekuma_delete_notification', 'notificationId']] as const) {
+    const t = tool(name);
+    assert.equal(t.schema.safeParse({ [key]: 3 }).success, false, name);
+    await assert.rejects(() => t.handler(t.schema.parse({ [key]: 3, confirmId: 4 })), /confirmId/, name);
+  }
+});

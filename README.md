@@ -131,11 +131,11 @@ A Kuma monitor makes real requests from the Kuma host, so monitor inputs are res
 | Variable | Effect |
 |---|---|
 | `KUMA_MCP_ALLOW_WRITE_METHODS=1` | Allow HTTP methods other than GET/HEAD and request bodies (default: refused) |
-| `KUMA_MCP_DENY_HOSTS` | Comma-separated extra denied targets: host, `*` glob, IPv4 CIDR, or `host:port`. Added to the built-ins (loopback, `0.0.0.0`, 169.254.0.0/16, `host.docker.internal`, any host containing `bifrost` or `mcp`). List your gateway host:port here. |
+| `KUMA_MCP_DENY_HOSTS` | Comma-separated extra denied targets: host, `*` glob, IPv4 CIDR, or `host:port`. Added to the built-ins (loopback, `0.0.0.0`, 169.254.0.0/16, IPv6 link-local/ULA/IPv4-compatible/NAT64, `0.0.0.0/8`, `host.docker.internal`, any host containing `bifrost` or `mcp`). List your gateway host:port here. |
 
-The denylist checks the literal `url`/`hostname`; a public DNS name resolving to an internal address is not detected.
+The denylist checks the literal `url`, `hostname` and `dns_resolve_server` (schemes limited to http/https/ws/wss). While write methods are disabled, `maxredirects` defaults to 0 and is capped at 2, and editing the target of an existing POST/body monitor is refused; a public DNS name resolving to an internal address is not detected.
 
-Destructive or exposing calls need explicit confirmation: `delete_status_page` (`confirmSlug`), `delete_maintenance` (`confirmId`), `save_status_page` on a published page (`confirmPublic`), and a `manual` maintenance window covering more than 5 monitors or without an end time (`confirmOpenEnded`). Push monitors that have no token cannot be edited (tokens are only generated on creation).
+Destructive or exposing calls need explicit confirmation: `delete_monitor` / `delete_notification` (`confirmId`), `delete_status_page` (`confirmSlug`), `delete_maintenance` (`confirmId`), `save_status_page` on a published page (`confirmPublic`), and a `manual` maintenance window covering more than 5 monitors or without an end time (`confirmOpenEnded`). Push monitors that have no token cannot be edited (tokens are only generated on creation).
 
 ### Secrets
 

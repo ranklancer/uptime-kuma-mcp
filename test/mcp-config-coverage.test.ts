@@ -129,7 +129,7 @@ test('add payload carries every NOT NULL default the UI sends', () => {
   assert.equal(p.retryInterval, 60);
   assert.equal(p.maxretries, 0);
   assert.equal(p.resendInterval, 0);
-  assert.equal(p.maxredirects, 10);
+  assert.equal(p.maxredirects, 0);
   assert.deepEqual(p.notificationIDList, {});
   assert.deepEqual(p.kafkaProducerBrokers, []);
   assert.deepEqual(p.kafkaProducerSaslOptions, { mechanism: 'None' });
