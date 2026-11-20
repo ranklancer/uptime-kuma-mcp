@@ -1,16 +1,30 @@
 import { io, Socket } from 'socket.io-client';
 import type { KumaInstanceConfig, KumaSession, MonitorOpts } from './types.js';
+import { buildAddPayload, buildEditPayload, fingerprint } from './payload.js';
 import {
   redactMonitorAck, redactHeartbeatAck, redactNotification, safeFailureText,
   assertMonitorEditAllowed, assertNotificationEditAllowed,
 } from './redact.js';
+
+/** Kuma's checkLogin() throws "You are not logged in." which handlers return as { ok: false, msg }. */
+export function isNotLoggedIn(res: any): boolean {
+  return !!res && typeof res === 'object' && res.ok === false && typeof res.msg === 'string' && /not logged in/i.test(res.msg);
+}
 
 const TOKEN_TTL_MS = 48 * 60 * 60 * 1000; // re-auth every 48h to be safe
 
 export class UptimeKumaClient {
   private socket: Socket | null = null;
   private session: KumaSession | null = null;
+  /** True while the socket is connected (reset by socket.io disconnect, set again on every (re)connect). */
   private connected = false;
+  /**
+   * True only after a successful login/loginByToken on the CURRENT socket connection.
+   * Kuma ties authentication to the socket, so every (re)connect starts unauthenticated:
+   * this flag is cleared on every 'connect' and 'disconnect' and set by authenticate().
+   */
+  private authed = false;
+  private loginInFlight: Promise<void> | null = null;
 
   /**
    * Cached monitor list. Uptime Kuma pushes the full list via the
@@ -40,46 +54,84 @@ export class UptimeKumaClient {
   private notificationCacheReady = false;
   private notificationCacheWaiters: Array<() => void> = [];
 
-  constructor(private cfg: KumaInstanceConfig) {}
+  /** `ioFactory` is injectable so tests can drive the reconnect/re-auth paths with a fake socket. */
+  constructor(private cfg: KumaInstanceConfig, private ioFactory: typeof io = io) {}
 
   // ── Connection management ───────────────────────────────────
 
-  /** Ensure the Socket.IO connection is established and authenticated. */
+  /**
+   * Ensure the Socket.IO connection is up AND logged in.
+   *
+   * Kuma binds auth to the socket. socket.io auto-reconnects after a Kuma restart, but the
+   * new server-side socket is unauthenticated, so every reconnect must re-login before the
+   * next call (otherwise Kuma replies "You are not logged in.").
+   */
   private async ensureConnected(): Promise<Socket> {
-    if (this.socket && this.connected && this.session) {
-      const age = Date.now() - this.session.obtainedAt;
-      if (age < TOKEN_TTL_MS) return this.socket;
-      // Token too old — re-auth
-      await this.authenticate();
+    // No socket, or socket.io gave up reconnecting: build a fresh connection (connect() logs in).
+    if (!this.socket || (!this.socket.connected && !this.socket.active)) {
+      await this.connect();
       return this.socket!;
     }
+    // socket.io is mid-reconnect: wait for it rather than emitting into a dead socket.
+    if (!this.socket.connected) await this.waitForReconnect();
 
-    await this.connect();
+    const tokenExpired = !!this.session && Date.now() - this.session.obtainedAt >= TOKEN_TTL_MS;
+    if (!this.authed || !this.session || tokenExpired) {
+      await this.authenticate();
+    }
     return this.socket!;
+  }
+
+  private waitForReconnect(timeoutMs = 15_000): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const sock = this.socket;
+      if (!sock) return reject(new Error(`[${this.cfg.name}] no socket connection`));
+      if (sock.connected) return resolve();
+      const timer = setTimeout(() => {
+        sock.off('connect', onConnect);
+        reject(new Error(`[${this.cfg.name}] timeout waiting for Socket.IO reconnect`));
+      }, timeoutMs);
+      const onConnect = () => { clearTimeout(timer); resolve(); };
+      sock.once('connect', onConnect);
+    });
+  }
+
+  /** Reset per-connection state: the new Kuma socket is unauthenticated and will re-push its lists after login. */
+  private markLoggedOut(): void {
+    this.authed = false;
+    this.loginInFlight = null;
+    this.monitorCacheReady = false;
+    this.notificationCacheReady = false;
   }
 
   /** Establish a Socket.IO connection and authenticate. */
   private async connect(): Promise<void> {
     if (this.socket) {
-      try { this.socket.disconnect(); } catch { /* swallow */ }
+      try { this.socket.removeAllListeners(); this.socket.disconnect(); } catch { /* swallow */ }
     }
 
     // Reset cache state on new connection
     this.monitorCache = {};
-    this.monitorCacheReady = false;
     this.heartbeatStatusCache.clear();
     this.notificationCache = [];
-    this.notificationCacheReady = false;
+    this.connected = false;
+    this.markLoggedOut();
 
-    this.socket = io(this.cfg.baseUrl, {
+    this.socket = this.ioFactory(this.cfg.baseUrl, {
       path: '/socket.io',
       transports: ['websocket'],
       reconnection: true,
-      reconnectionAttempts: 5,
+      reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
+      reconnectionDelayMax: 15_000,
       timeout: 10_000,
       rejectUnauthorized: !this.cfg.insecureTLS,
     });
+
+    // Persistent lifecycle handlers, registered BEFORE anything else so they run first on
+    // every (re)connect: a new connection is never authenticated.
+    this.socket.on('connect', () => { this.connected = true; this.markLoggedOut(); });
+    this.socket.on('disconnect', () => { this.connected = false; this.markLoggedOut(); });
 
     // Listen for monitor list pushes from Uptime Kuma.
     // This event fires after login and on every monitor change.
@@ -126,38 +178,48 @@ export class UptimeKumaClient {
     });
 
     await new Promise<void>((resolve, reject) => {
+      const sock = this.socket!;
       const timer = setTimeout(() => reject(new Error(
         `[${this.cfg.name}] Socket.IO connection timeout to ${this.cfg.baseUrl}`
       )), 15_000);
 
-      this.socket!.on('connect', () => {
-        clearTimeout(timer);
-        this.connected = true;
-        resolve();
-      });
-
-      this.socket!.on('connect_error', (err) => {
+      if (sock.connected) { clearTimeout(timer); return resolve(); }
+      sock.once('connect', () => { clearTimeout(timer); resolve(); });
+      // Only the FIRST connect_error is fatal for this call; socket.io keeps retrying afterwards.
+      sock.once('connect_error', (err) => {
         clearTimeout(timer);
         reject(new Error(`[${this.cfg.name}] Socket.IO connect error: ${err.message}`));
       });
     });
 
-    this.socket.on('disconnect', () => { this.connected = false; });
-
     await this.authenticate();
   }
 
-  /** Authenticate via Socket.IO login event. */
-  private async authenticate(): Promise<void> {
+  /** Authenticate via Socket.IO login event (single-flight: concurrent callers share one login). */
+  private authenticate(): Promise<void> {
+    if (!this.loginInFlight) {
+      const p: Promise<void> = this.doAuthenticate().finally(() => {
+        if (this.loginInFlight === p) this.loginInFlight = null;
+      });
+      this.loginInFlight = p;
+    }
+    return this.loginInFlight;
+  }
+
+  private async doAuthenticate(): Promise<void> {
     if (!this.socket) throw new Error(`[${this.cfg.name}] no socket connection`);
+    const sock = this.socket;
+    this.authed = false;
 
     // Try loginByToken first if we have a cached token
     if (this.session?.token) {
       const tokenRes = await this.emitWithAck('loginByToken', this.session.token);
       if (tokenRes?.ok) {
         this.session.obtainedAt = Date.now();
+        if (this.socket === sock) this.authed = true;
         return;
       }
+      this.session = null; // rejected (expired / Kuma restarted with a new secret): fall back to password
     }
 
     const res = await this.emitWithAck('login', {
@@ -168,7 +230,7 @@ export class UptimeKumaClient {
 
     if (!res?.ok) {
       throw new Error(
-        `[${this.cfg.name}] auth failed: ${res?.msg ?? 'unknown error'}`
+        `[${this.cfg.name}] auth failed: ${safeFailureText(res)}`
       );
     }
 
@@ -176,6 +238,21 @@ export class UptimeKumaClient {
       token: res.token,
       obtainedAt: Date.now(),
     };
+    // Ignore a login that completed on a socket that has since been replaced or dropped.
+    if (this.socket === sock && sock.connected) this.authed = true;
+  }
+
+  /**
+   * Emit an authenticated event. If Kuma answers "You are not logged in." (socket was
+   * reconnected or the server restarted underneath us), re-login and retry exactly once.
+   * Every tool-facing call goes through here; only login events use emitWithAck directly.
+   */
+  private async request(event: string, ...args: any[]): Promise<any> {
+    const res = await this.emitWithAck(event, ...args);
+    if (!isNotLoggedIn(res)) return res;
+    this.authed = false;
+    await this.ensureConnected();
+    return this.emitWithAck(event, ...args);
   }
 
   /** Emit an event and wait for the callback response. */
@@ -235,6 +312,8 @@ export class UptimeKumaClient {
       this.socket = null;
     }
     this.connected = false;
+    this.authed = false;
+    this.loginInFlight = null;
     this.session = null;
     this.monitorCache = {};
     this.monitorCacheReady = false;
@@ -273,7 +352,7 @@ export class UptimeKumaClient {
   /** INTERNAL / RAW: unredacted ack. Never return this from a tool; editMonitor needs the real values to merge. */
   private async getMonitorRaw(monitorId: number): Promise<any> {
     await this.ensureConnected();
-    return this.emitWithAck('getMonitor', monitorId);
+    return this.request('getMonitor', monitorId);
   }
 
   /**
@@ -287,7 +366,7 @@ export class UptimeKumaClient {
    */
   async getHeartbeats(monitorId: number, periodHours = 24): Promise<any> {
     await this.ensureConnected();
-    const res = await this.emitWithAck('getMonitorBeats', monitorId, periodHours);
+    const res = await this.request('getMonitorBeats', monitorId, periodHours);
     return redactHeartbeatAck(res);
   }
 
@@ -330,58 +409,54 @@ export class UptimeKumaClient {
   /** List status pages. */
   async listStatusPages(): Promise<any> {
     await this.ensureConnected();
-    const res = await this.emitWithAck('getStatusPageList');
+    const res = await this.request('getStatusPageList');
     return res;
   }
 
   /** List all tags. */
   async listTags(): Promise<any> {
     await this.ensureConnected();
-    const res = await this.emitWithAck('getTags');
+    const res = await this.request('getTags');
     return res;
   }
 
   /** List maintenance windows. */
   async listMaintenance(): Promise<any> {
     await this.ensureConnected();
-    const res = await this.emitWithAck('getMaintenanceList');
+    const res = await this.request('getMaintenanceList');
     return res;
   }
 
   // ── Write operations ────────────────────────────────────────
 
-  /** Add a new monitor. */
+  /**
+   * Add a new monitor. The payload is the full set of defaults the Kuma UI sends
+   * (see payload.ts), so no NOT NULL column is left undefined.
+   *
+   * PUSH MONITORS: a push token is generated client-side (as the UI does) when none is
+   * supplied. The token is a bearer secret (anyone holding it can forge heartbeats), so it is
+   * NEVER returned: the response carries the monitor id and a token fingerprint only. The
+   * operator reads the real push URL from the Kuma UI.
+   */
   async addMonitor(opts: MonitorOpts): Promise<any> {
     await this.ensureConnected();
-    const monitorData = {
-      type: opts.type ?? 'http',
-      name: opts.name,
-      url: opts.url,
-      method: opts.method ?? 'GET',
-      interval: opts.interval ?? 60,
-      retryInterval: opts.retryInterval ?? 60,
-      maxretries: opts.maxretries ?? 0,
-      hostname: opts.hostname,
-      port: opts.port,
-      keyword: opts.keyword,
-      accepted_statuscodes: opts.accepted_statuscodes ?? ['200-299'],
-      ignoreTls: opts.ignoreTls ?? false,
-      expiryNotification: opts.expiryNotification ?? false,
-      maxredirects: opts.maxredirects ?? 10,
-      dns_resolve_type: opts.dns_resolve_type,
-      dns_resolve_server: opts.dns_resolve_server,
-      notificationIDList: opts.notificationIDList ?? {},
-      description: opts.description ?? '',
-      parent: opts.parent,
-    };
-    const res = await this.emitWithAck('add', monitorData);
+    const monitorData = buildAddPayload(opts);
+    const res = await this.request('add', monitorData);
     if (!res?.ok) {
       throw new Error(`[${this.cfg.name}] add monitor failed: ${safeFailureText(res)}`);
     }
-    return redactMonitorAck(res);
+    const out = redactMonitorAck(res);
+    if (monitorData.type === 'push' && monitorData.pushToken) {
+      out.pushTokenFingerprint = fingerprint(String(monitorData.pushToken));
+    }
+    return out;
   }
 
-  /** Edit an existing monitor. */
+  /**
+   * Edit an existing monitor: load the current monitor, merge the changes and emit the FULL
+   * object (Kuma's editMonitor overwrites every column from the payload, so a partial object
+   * would blank or fail to persist the fields it omits).
+   */
   async editMonitor(monitorId: number, opts: MonitorOpts): Promise<any> {
     await this.ensureConnected();
     // Fetch current data first to merge
@@ -392,8 +467,8 @@ export class UptimeKumaClient {
     // H1: a monitor that holds credentials may not be repointed (Kuma would send the stored
     // credentials to the new destination on the next check). Compared against RAW values.
     assertMonitorEditAllowed(current.monitor, opts);
-    const merged = { ...current.monitor, ...opts, id: monitorId };
-    const res = await this.emitWithAck('editMonitor', merged);
+    const merged = buildEditPayload(current.monitor, opts, monitorId);
+    const res = await this.request('editMonitor', merged);
     if (!res?.ok) {
       throw new Error(`[${this.cfg.name}] edit monitor failed: ${safeFailureText(res)}`);
     }
@@ -403,7 +478,7 @@ export class UptimeKumaClient {
   /** Delete a monitor by ID. */
   async deleteMonitor(monitorId: number): Promise<any> {
     await this.ensureConnected();
-    const res = await this.emitWithAck('deleteMonitor', monitorId);
+    const res = await this.request('deleteMonitor', monitorId);
     if (!res?.ok) {
       throw new Error(`[${this.cfg.name}] delete monitor failed: ${safeFailureText(res)}`);
     }
@@ -413,7 +488,7 @@ export class UptimeKumaClient {
   /** Pause a monitor by ID. */
   async pauseMonitor(monitorId: number): Promise<any> {
     await this.ensureConnected();
-    const res = await this.emitWithAck('pauseMonitor', monitorId);
+    const res = await this.request('pauseMonitor', monitorId);
     if (!res?.ok) {
       throw new Error(`[${this.cfg.name}] pause monitor failed: ${safeFailureText(res)}`);
     }
@@ -423,7 +498,7 @@ export class UptimeKumaClient {
   /** Resume a monitor by ID. */
   async resumeMonitor(monitorId: number): Promise<any> {
     await this.ensureConnected();
-    const res = await this.emitWithAck('resumeMonitor', monitorId);
+    const res = await this.request('resumeMonitor', monitorId);
     if (!res?.ok) {
       throw new Error(`[${this.cfg.name}] resume monitor failed: ${safeFailureText(res)}`);
     }
@@ -445,7 +520,7 @@ export class UptimeKumaClient {
     notificationID: number | null = null,
   ): Promise<any> {
     await this.ensureConnected();
-    const res = await this.emitWithAck('addNotification', notification, notificationID ?? null);
+    const res = await this.request('addNotification', notification, notificationID ?? null);
     if (!res?.ok) {
       throw new Error(`[${this.cfg.name}] save notification failed: ${safeFailureText(res)}`);
     }
@@ -487,7 +562,7 @@ export class UptimeKumaClient {
   /** Delete a notification provider by ID. Returns { ok, msg }. */
   async deleteNotification(notificationID: number): Promise<any> {
     await this.ensureConnected();
-    const res = await this.emitWithAck('deleteNotification', notificationID);
+    const res = await this.request('deleteNotification', notificationID);
     if (!res?.ok) {
       throw new Error(`[${this.cfg.name}] delete notification failed: ${safeFailureText(res)}`);
     }
@@ -571,5 +646,119 @@ export class UptimeKumaClient {
       failed: results.filter((r) => !r.ok).length,
       results,
     };
+  }
+
+  // ── Tags ────────────────────────────────────────────────────
+
+  /** Create a tag. Returns { ok, tag }. */
+  async createTag(name: string, color: string): Promise<any> {
+    await this.ensureConnected();
+    const res = await this.request('addTag', { name, color });
+    if (!res?.ok) throw new Error(`[${this.cfg.name}] create tag failed: ${safeFailureText(res)}`);
+    return res;
+  }
+
+  /** Attach an existing tag (with optional value) to a monitor. */
+  async addMonitorTag(tagId: number, monitorId: number, value = ''): Promise<any> {
+    await this.ensureConnected();
+    const res = await this.request('addMonitorTag', tagId, monitorId, value);
+    if (!res?.ok) throw new Error(`[${this.cfg.name}] add monitor tag failed: ${safeFailureText(res)}`);
+    return res;
+  }
+
+  /** Detach a tag (matched on tag + monitor + value) from a monitor. */
+  async removeMonitorTag(tagId: number, monitorId: number, value = ''): Promise<any> {
+    await this.ensureConnected();
+    const res = await this.request('deleteMonitorTag', tagId, monitorId, value);
+    if (!res?.ok) throw new Error(`[${this.cfg.name}] remove monitor tag failed: ${safeFailureText(res)}`);
+    return res;
+  }
+
+  // ── Maintenance ─────────────────────────────────────────────
+
+  /**
+   * Create a maintenance window (Kuma's Maintenance.jsonToBean shape) and optionally attach
+   * monitors. Returns { ok, maintenanceID }.
+   */
+  async addMaintenance(maintenance: Record<string, any>, monitorIds: number[] = []): Promise<any> {
+    await this.ensureConnected();
+    const res = await this.request('addMaintenance', maintenance);
+    if (!res?.ok) throw new Error(`[${this.cfg.name}] add maintenance failed: ${safeFailureText(res)}`);
+    if (monitorIds.length > 0) {
+      const att = await this.request('addMonitorMaintenance', res.maintenanceID, monitorIds.map((id) => ({ id })));
+      if (!att?.ok) {
+        throw new Error(
+          `[${this.cfg.name}] maintenance ${res.maintenanceID} created but attaching monitors failed: ${safeFailureText(att)}`);
+      }
+    }
+    return res;
+  }
+
+  /** Replace the monitors attached to a maintenance window. */
+  async setMaintenanceMonitors(maintenanceId: number, monitorIds: number[]): Promise<any> {
+    await this.ensureConnected();
+    const res = await this.request('addMonitorMaintenance', maintenanceId, monitorIds.map((id) => ({ id })));
+    if (!res?.ok) throw new Error(`[${this.cfg.name}] set maintenance monitors failed: ${safeFailureText(res)}`);
+    return res;
+  }
+
+  async pauseMaintenance(maintenanceId: number): Promise<any> {
+    await this.ensureConnected();
+    const res = await this.request('pauseMaintenance', maintenanceId);
+    if (!res?.ok) throw new Error(`[${this.cfg.name}] pause maintenance failed: ${safeFailureText(res)}`);
+    return res;
+  }
+
+  async resumeMaintenance(maintenanceId: number): Promise<any> {
+    await this.ensureConnected();
+    const res = await this.request('resumeMaintenance', maintenanceId);
+    if (!res?.ok) throw new Error(`[${this.cfg.name}] resume maintenance failed: ${safeFailureText(res)}`);
+    return res;
+  }
+
+  async deleteMaintenance(maintenanceId: number): Promise<any> {
+    await this.ensureConnected();
+    const res = await this.request('deleteMaintenance', maintenanceId);
+    if (!res?.ok) throw new Error(`[${this.cfg.name}] delete maintenance failed: ${safeFailureText(res)}`);
+    return res;
+  }
+
+  // ── Status pages ────────────────────────────────────────────
+
+  /** Create an (empty) status page. Returns { ok, slug }. */
+  async addStatusPage(title: string, slug: string): Promise<any> {
+    await this.ensureConnected();
+    const res = await this.request('addStatusPage', title, slug);
+    if (!res?.ok) throw new Error(`[${this.cfg.name}] add status page failed: ${safeFailureText(res)}`);
+    return res;
+  }
+
+  /**
+   * Save a status page. Kuma's saveStatusPage REPLACES the whole group list, so `groups` is
+   * required and is the complete desired list. Page config is loaded, merged with `changes`
+   * and re-sent in full; the existing logo path is preserved.
+   */
+  async saveStatusPage(
+    slug: string,
+    changes: { title?: string; description?: string; theme?: string; footerText?: string; showPoweredBy?: boolean; showTags?: boolean; autoRefreshInterval?: number },
+    groups: Array<{ name: string; monitorIds: number[] }>,
+  ): Promise<any> {
+    await this.ensureConnected();
+    const cur = await this.request('getStatusPage', slug);
+    if (!cur?.ok || !cur.config) throw new Error(`[${this.cfg.name}] status page '${slug}' not found`);
+    const config: Record<string, any> = { ...cur.config };
+    for (const [k, v] of Object.entries(changes)) if (v !== undefined) config[k] = v;
+    config.slug = slug;
+    const publicGroupList = groups.map((g) => ({ name: g.name, monitorList: g.monitorIds.map((id) => ({ id })) }));
+    const res = await this.request('saveStatusPage', slug, config, config.icon ?? '', publicGroupList);
+    if (!res?.ok) throw new Error(`[${this.cfg.name}] save status page failed: ${safeFailureText(res)}`);
+    return { ok: true, slug };
+  }
+
+  async deleteStatusPage(slug: string): Promise<any> {
+    await this.ensureConnected();
+    const res = await this.request('deleteStatusPage', slug);
+    if (!res?.ok) throw new Error(`[${this.cfg.name}] delete status page failed: ${safeFailureText(res)}`);
+    return res;
   }
 }

@@ -114,6 +114,25 @@ Docker secrets are supported as a fallback: `/run/secrets/<name>_password` (lowe
 | `uptimekuma_delete_monitor` | Permanently delete a monitor |
 | `uptimekuma_pause_monitor` | Pause a monitor (stops checking) |
 | `uptimekuma_resume_monitor` | Resume a paused monitor |
+| `uptimekuma_create_tag` / `uptimekuma_add_monitor_tag` / `uptimekuma_remove_monitor_tag` | Create tags; attach/detach them on monitors (`add_monitor` / `edit_monitor` also take a `tags` array) |
+| `uptimekuma_add_maintenance` | Create a maintenance window (manual, single, recurring, cron) and attach monitors |
+| `uptimekuma_pause_maintenance` / `uptimekuma_resume_maintenance` / `uptimekuma_delete_maintenance` | Manage a maintenance window |
+| `uptimekuma_add_status_page` / `uptimekuma_save_status_page` / `uptimekuma_delete_status_page` | Create, update (title, theme, footer, groups) or delete a status page. `save_status_page` replaces the whole group list: pass the complete `groups` array |
+
+### Monitor add / edit semantics
+
+- **`add_monitor`** sends the same complete payload as the Kuma UI (defaults for every NOT NULL column such as `conditions`, `kafkaProducer*`, `rabbitmqNodes`; `accepted_statuscodes` as an array; `timeout` = 80% of `interval`, 10 for ping). Supported fields include `timeout`, `parent`, `docker_host`, `docker_container`, `headers`, `body`, `authMethod`, `basic_auth_user`/`basic_auth_pass`, `maxredirects`, `upsideDown`, `invertKeyword`, `resendInterval`, `expiryNotification`, `tags`. `accepted_statuscodes` takes an array or a comma-separated string.
+- **`edit_monitor`** loads the current monitor, merges your changes and emits the FULL object (Kuma's `editMonitor` overwrites every field, so partial payloads used to drop or fail to persist fields such as `keyword` and `accepted_statuscodes`). Omitted fields are preserved; `null` is only applied to nullable columns (`parent`, `docker_host`, ...). A monitor that already holds credentials cannot have its destination changed (url, host, port, docker, auth, ...).
+
+### Secrets
+
+All monitor and notification responses are an allowlist projection: credentials (push token, basic-auth password, headers, bodies, DSNs, notification configs) come back as `{ "value": "***REDACTED***", "present": true|false }`. Credential inputs (`basic_auth_pass`, `headers`, `body`) are accepted on write but never echoed.
+
+**Push monitors:** `pushToken` is deliberately not a tool parameter and is never returned. `add_monitor` with `type: "push"` generates a 32-character alphanumeric token (as the UI does) and returns only the monitor id plus `pushTokenFingerprint` (first 8 hex of its sha256) so you can recognise the token without being able to use it. An MCP client therefore cannot forge heartbeats; read the push URL in the Kuma UI.
+
+### Connection and re-authentication
+
+Kuma binds login to the Socket.IO connection. The client clears its auth state on every `connect` and `disconnect` and logs in again (token first, then password) before the next call, so Kuma restarts and socket.io auto-reconnects no longer end in `You are not logged in.`. As a safety net, a call answered with that message triggers one re-login and one retry.
 
 Every tool accepts an optional `instance` parameter to target a specific Uptime Kuma instance. Defaults to the first configured instance.
 

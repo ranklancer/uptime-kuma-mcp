@@ -23,6 +23,66 @@ function instanceSchema() {
 
 const Instance = instanceSchema();
 
+
+// ── Shared monitor field schema (add + edit) ────────────────────
+
+const monitorFields = {
+  url:                z.string().optional().describe('URL to monitor (http/keyword types)'),
+  hostname:           z.string().optional().describe('Hostname for ping/port/dns types'),
+  port:               z.number().int().optional().describe('Port number'),
+  method:             z.string().optional().describe('HTTP method (GET, POST, ...)'),
+  interval:           z.number().int().positive().optional().describe('Check interval in seconds (default 60)'),
+  retryInterval:      z.number().int().optional().describe('Retry interval in seconds (default 60)'),
+  resendInterval:     z.number().int().min(0).optional().describe('Resend notification every N checks while down (0 = off)'),
+  maxretries:         z.number().int().min(0).optional().describe('Max retries before marking down (default 0)'),
+  timeout:            z.number().min(0).optional().describe('Check timeout in seconds (default: 80% of interval; 10 for ping)'),
+  keyword:            z.string().optional().describe('Expected keyword in response (keyword type)'),
+  invertKeyword:      z.boolean().optional().describe('Treat the keyword being PRESENT as a failure'),
+  accepted_statuscodes: z.union([z.array(z.string()), z.string()]).optional()
+    .describe('Accepted HTTP status codes: an array (["200-299","301"]) or a comma-separated string ("200-299,301")'),
+  maxredirects:       z.number().int().min(0).optional().describe('Max redirects to follow (default 10)'),
+  ignoreTls:          z.boolean().optional().describe('Ignore TLS certificate errors'),
+  upsideDown:         z.boolean().optional().describe('Upside-down mode: reachable counts as DOWN'),
+  expiryNotification: z.boolean().optional().describe('Notify on TLS certificate expiry'),
+  description:        z.string().optional().describe('Monitor description'),
+  parent:             z.number().int().nullable().optional().describe('Parent group monitor ID (null to move to root)'),
+  dns_resolve_type:   z.string().optional().describe('DNS record type (A, AAAA, MX, ...)'),
+  dns_resolve_server: z.string().optional().describe('DNS server to use for resolution'),
+  docker_host:        z.number().int().nullable().optional().describe('Numeric ID of the Docker host (docker type)'),
+  docker_container:   z.string().optional().describe('Container name (docker type)'),
+  headers:            z.union([z.string(), z.record(z.string())]).optional().describe('HTTP headers as a JSON object or JSON string. Treated as a credential: never echoed.'),
+  body:               z.union([z.string(), z.record(z.any())]).optional().describe('HTTP request body (JSON object or string). Never echoed.'),
+  authMethod:         z.enum(['basic', 'ntlm', 'mtls', 'oauth2-cc']).nullable().optional().describe('HTTP authentication method (null = none)'),
+  basic_auth_user:    z.string().optional().describe('Basic-auth username. Never echoed.'),
+  basic_auth_pass:    z.string().optional().describe('Basic-auth password. Accepted, never echoed.'),
+  tags:               z.array(z.object({
+    tagId: z.number().int().positive().describe('Existing tag ID (see uptimekuma_list_tags / uptimekuma_create_tag)'),
+    value: z.string().optional().default('').describe('Optional tag value'),
+  })).optional().describe('Tags to attach after the monitor is saved (additive; use uptimekuma_remove_monitor_tag to detach)'),
+};
+
+/** Map tool args to client MonitorOpts (notificationIds -> notificationIDList). */
+function toMonitorOpts(args: Record<string, any>): Record<string, any> {
+  const { notificationIds, ...opts } = args;
+  if (Array.isArray(notificationIds)) {
+    opts.notificationIDList = Object.fromEntries(notificationIds.map((id: number) => [String(id), true]));
+  }
+  return opts;
+}
+
+async function attachTags(client: ReturnType<typeof getClient>, monitorId: number, tags: Array<{ tagId: number; value?: string }>) {
+  const results: Array<{ tagId: number; ok: boolean; error?: string }> = [];
+  for (const t of tags) {
+    try {
+      await client.addMonitorTag(t.tagId, monitorId, t.value ?? '');
+      results.push({ tagId: t.tagId, ok: true });
+    } catch (e: any) {
+      results.push({ tagId: t.tagId, ok: false, error: String(e?.message ?? e) });
+    }
+  }
+  return results;
+}
+
 export interface ToolDef {
   name: string;
   description: string;
@@ -171,74 +231,49 @@ export const toolDefs: ToolDef[] = [
   {
     name: 'uptimekuma_add_monitor',
     description:
-      'Create a new monitor. Supports HTTP, ping, port, keyword, DNS, Docker, and many more types.',
+      'Create a new monitor. Supports HTTP, ping, port, keyword, DNS, Docker, push, group and more. ' +
+      'The full payload Kuma\'s UI sends is built for you (defaults for every NOT NULL column; timeout defaults to 80% of ' +
+      'the interval). For type=push a push token is generated server-side and is NEVER returned: the response contains ' +
+      'only the monitor id and a token fingerprint (first 8 hex of sha256); read the push URL in the Kuma UI. ' +
+      'Credential inputs (basic_auth_pass, headers, body) are accepted but never echoed.',
     schema: z.object({
       instance:           Instance,
       type:               z.enum(MONITOR_TYPES).default('http').describe('Monitor type'),
       name:               z.string().min(1).describe('Display name for the monitor'),
-      url:                z.string().optional().describe('URL to monitor (for http/keyword types)'),
-      hostname:           z.string().optional().describe('Hostname for ping/port/dns types'),
-      port:               z.number().int().optional().describe('Port number for port-type monitors'),
-      method:             z.string().optional().default('GET').describe('HTTP method (GET, POST, etc.)'),
-      interval:           z.number().int().positive().optional().default(60).describe('Check interval in seconds'),
-      retryInterval:      z.number().int().optional().default(60).describe('Retry interval in seconds'),
-      maxretries:         z.number().int().optional().default(0).describe('Max retries before marking down'),
-      keyword:            z.string().optional().describe('Expected keyword in response (for keyword type)'),
-      accepted_statuscodes: z.string().optional().default('200-299').describe('Accepted HTTP status codes (e.g. "200-299")'),
-      ignoreTls:          z.boolean().optional().default(false).describe('Ignore TLS certificate errors'),
-      description:        z.string().optional().describe('Monitor description'),
-      dns_resolve_type:   z.string().optional().describe('DNS record type (A, AAAA, MX, etc.)'),
-      dns_resolve_server: z.string().optional().describe('DNS server to use for resolution'),
+      ...monitorFields,
       notificationIds:    z.array(z.number().int()).optional().describe('Notification provider IDs to attach to this monitor (see uptimekuma_list_notifications for IDs)'),
     }),
     handler: async (args) => {
-      const opts: Record<string, any> = {
-        ...args,
-        accepted_statuscodes: args.accepted_statuscodes
-          ? args.accepted_statuscodes.split(',').map((s: string) => s.trim())
-          : ['200-299'],
-      };
-      if (Array.isArray(args.notificationIds)) {
-        opts.notificationIDList = Object.fromEntries(
-          args.notificationIds.map((id: number) => [String(id), true]),
-        );
-        delete opts.notificationIds;
+      const { instance: _i, tags, ...rest } = args;
+      const opts = toMonitorOpts(rest);
+      const created = await getClient(args.instance).addMonitor(opts);
+      if (Array.isArray(tags) && tags.length > 0 && created?.monitorID) {
+        created.tags = await attachTags(getClient(args.instance), created.monitorID, tags);
       }
-      return getClient(args.instance).addMonitor(opts);
+      return created;
     },
   },
   {
     name: 'uptimekuma_edit_monitor',
-    description: 'Update an existing monitor. Only the provided fields will be changed.',
+    description:
+      'Update an existing monitor. The current monitor is loaded, your changes are merged, and the FULL object is sent ' +
+      '(Kuma replaces every field on edit), so omitted fields are preserved. Credential values are never returned. ' +
+      'A monitor that already holds credentials cannot have its destination (url/host/port/docker/auth/...) changed.',
     schema: z.object({
       instance:           Instance,
       monitorId:          z.number().int().positive().describe('The numeric ID of the monitor to edit'),
       name:               z.string().optional().describe('New display name'),
-      url:                z.string().optional().describe('New URL'),
-      hostname:           z.string().optional().describe('New hostname'),
-      port:               z.number().int().optional().describe('New port'),
-      interval:           z.number().int().positive().optional().describe('New check interval in seconds'),
-      retryInterval:      z.number().int().optional().describe('New retry interval in seconds'),
-      maxretries:         z.number().int().optional().describe('New max retries'),
-      keyword:            z.string().optional().describe('New keyword to check'),
-      accepted_statuscodes: z.string().optional().describe('New accepted HTTP status codes'),
-      ignoreTls:          z.boolean().optional().describe('Ignore TLS errors'),
-      description:        z.string().optional().describe('New description'),
-      parent:             z.number().int().nullable().optional().describe('Parent group monitor ID (null to move to root)'),
+      ...monitorFields,
       notificationIds:    z.array(z.number().int()).optional().describe('Notification provider IDs to attach (replaces the monitor\'s current notification assignments)'),
     }),
     handler: async (args) => {
-      const { instance, monitorId, ...opts } = args;
-      if (opts.accepted_statuscodes) {
-        opts.accepted_statuscodes = opts.accepted_statuscodes.split(',').map((s: string) => s.trim());
+      const { instance, monitorId, tags, ...rest } = args;
+      const client = getClient(instance);
+      const result = await client.editMonitor(monitorId, toMonitorOpts(rest));
+      if (Array.isArray(tags) && tags.length > 0) {
+        result.tags = await attachTags(client, monitorId, tags);
       }
-      if (Array.isArray(opts.notificationIds)) {
-        opts.notificationIDList = Object.fromEntries(
-          opts.notificationIds.map((id: number) => [String(id), true]),
-        );
-        delete opts.notificationIds;
-      }
-      return getClient(instance).editMonitor(monitorId, opts);
+      return result;
     },
   },
   {
@@ -359,5 +394,137 @@ export const toolDefs: ToolDef[] = [
         dryRun: args.dryRun,
         includeGroups: args.includeGroups,
       }),
+  },
+
+  // ── Tags ─────────────────────────────────────────────────────────
+
+  {
+    name: 'uptimekuma_create_tag',
+    description: 'Create a tag (name + colour). Returns the new tag including its id.',
+    schema: z.object({
+      instance: Instance,
+      name:     z.string().min(1).describe('Tag name'),
+      color:    z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#4B5563').describe('Hex colour, e.g. #4B5563'),
+    }),
+    handler: async (args) => getClient(args.instance).createTag(args.name, args.color),
+  },
+  {
+    name: 'uptimekuma_add_monitor_tag',
+    description: 'Attach an existing tag (optionally with a value) to a monitor.',
+    schema: z.object({
+      instance:  Instance,
+      tagId:     z.number().int().positive().describe('Tag ID'),
+      monitorId: z.number().int().positive().describe('Monitor ID'),
+      value:     z.string().optional().default('').describe('Optional tag value'),
+    }),
+    handler: async (args) => getClient(args.instance).addMonitorTag(args.tagId, args.monitorId, args.value),
+  },
+  {
+    name: 'uptimekuma_remove_monitor_tag',
+    description: 'Detach a tag from a monitor. The value must match the one it was attached with ("" if none).',
+    schema: z.object({
+      instance:  Instance,
+      tagId:     z.number().int().positive().describe('Tag ID'),
+      monitorId: z.number().int().positive().describe('Monitor ID'),
+      value:     z.string().optional().default('').describe('Tag value it was attached with'),
+    }),
+    handler: async (args) => getClient(args.instance).removeMonitorTag(args.tagId, args.monitorId, args.value),
+  },
+
+  // ── Maintenance ──────────────────────────────────────────────────
+
+  {
+    name: 'uptimekuma_add_maintenance',
+    description:
+      'Create a maintenance window and attach monitors to it. strategy: "manual" (active until paused), ' +
+      '"single" (one dateRange window), "recurring-interval" / "recurring-weekday" / "recurring-day-of-month" ' +
+      '(need timeRange), or "cron" (needs cron + durationMinutes).',
+    schema: z.object({
+      instance:       Instance,
+      title:          z.string().min(1),
+      description:    z.string().optional().default(''),
+      strategy:       z.enum(['manual', 'single', 'recurring-interval', 'recurring-weekday', 'recurring-day-of-month', 'cron']).default('manual'),
+      active:         z.boolean().optional().default(true),
+      monitorIds:     z.array(z.number().int().positive()).optional().default([]).describe('Monitors affected by this window'),
+      dateRange:      z.tuple([z.string().nullable(), z.string().nullable()]).optional().describe('[start, end] as "YYYY-MM-DD HH:mm:ss" (single strategy; null = unbounded)'),
+      timeRange:      z.tuple([z.object({ hours: z.number().int(), minutes: z.number().int() }), z.object({ hours: z.number().int(), minutes: z.number().int() })]).optional().describe('[start, end] time of day for recurring strategies'),
+      weekdays:       z.array(z.number().int().min(1).max(7)).optional().default([]).describe('1=Mon..7=Sun (recurring-weekday)'),
+      daysOfMonth:    z.array(z.union([z.number().int().min(1).max(31), z.literal('lastDay1')])).optional().default([]),
+      intervalDay:    z.number().int().positive().optional().default(1).describe('Every N days (recurring-interval)'),
+      cron:           z.string().optional().describe('Cron expression (cron strategy)'),
+      durationMinutes: z.number().int().positive().optional().default(60).describe('Window length in minutes (cron strategy)'),
+      timezoneOption: z.string().optional().default('UTC').describe('IANA timezone, or "SAME_AS_SERVER"'),
+    }),
+    handler: async (args) => {
+      const { instance, monitorIds, ...rest } = args;
+      const maintenance = {
+        ...rest,
+        dateRange: rest.dateRange ?? [null, null],
+        timeRange: rest.timeRange ?? [{ hours: 2, minutes: 0 }, { hours: 3, minutes: 0 }],
+      };
+      return getClient(instance).addMaintenance(maintenance, monitorIds);
+    },
+  },
+  {
+    name: 'uptimekuma_pause_maintenance',
+    description: 'Pause (deactivate) a maintenance window.',
+    schema: z.object({ instance: Instance, maintenanceId: z.number().int().positive() }),
+    handler: async (args) => getClient(args.instance).pauseMaintenance(args.maintenanceId),
+  },
+  {
+    name: 'uptimekuma_resume_maintenance',
+    description: 'Resume (reactivate) a maintenance window.',
+    schema: z.object({ instance: Instance, maintenanceId: z.number().int().positive() }),
+    handler: async (args) => getClient(args.instance).resumeMaintenance(args.maintenanceId),
+  },
+  {
+    name: 'uptimekuma_delete_maintenance',
+    description: 'Permanently delete a maintenance window. This cannot be undone.',
+    schema: z.object({ instance: Instance, maintenanceId: z.number().int().positive() }),
+    handler: async (args) => getClient(args.instance).deleteMaintenance(args.maintenanceId),
+  },
+
+  // ── Status pages ─────────────────────────────────────────────────
+
+  {
+    name: 'uptimekuma_add_status_page',
+    description: 'Create an empty status page. Use uptimekuma_save_status_page to add groups and monitors.',
+    schema: z.object({
+      instance: Instance,
+      title:    z.string().min(1),
+      slug:     z.string().regex(/^[a-z0-9_-]+$/).describe('URL slug (lowercase letters, digits, - and _)'),
+    }),
+    handler: async (args) => getClient(args.instance).addStatusPage(args.title, args.slug),
+  },
+  {
+    name: 'uptimekuma_save_status_page',
+    description:
+      'Save a status page. WARNING: Kuma replaces the whole group list, so `groups` is the COMPLETE desired list ' +
+      '(an empty array removes all groups). Page settings you omit are preserved.',
+    schema: z.object({
+      instance:    Instance,
+      slug:        z.string().min(1),
+      title:       z.string().min(1).optional(),
+      description: z.string().optional(),
+      theme:       z.enum(['auto', 'light', 'dark']).optional(),
+      footerText:  z.string().optional(),
+      showPoweredBy: z.boolean().optional(),
+      showTags:    z.boolean().optional(),
+      autoRefreshInterval: z.number().int().min(5).optional(),
+      groups:      z.array(z.object({
+        name:       z.string().min(1),
+        monitorIds: z.array(z.number().int().positive()),
+      })).describe('Complete list of monitor groups for the page'),
+    }),
+    handler: async (args) => {
+      const { instance, slug, groups, ...changes } = args;
+      return getClient(instance).saveStatusPage(slug, changes, groups);
+    },
+  },
+  {
+    name: 'uptimekuma_delete_status_page',
+    description: 'Permanently delete a status page by slug. This cannot be undone.',
+    schema: z.object({ instance: Instance, slug: z.string().min(1) }),
+    handler: async (args) => getClient(args.instance).deleteStatusPage(args.slug),
   },
 ];
