@@ -37,9 +37,47 @@ function validEntry(e: string): boolean {
   const c6 = /^([0-9a-f:.]*:[0-9a-f:.]*)\/(\d{1,3})$/i.exec(e);
   if (c6) return ipv6ToBig(c6[1]) !== null && Number(c6[2]) <= 128;
   const b6 = /^\[([0-9a-f:.]+)\](?::(\d{1,5}))?$/i.exec(e);
-  if (b6) return ipv6ToBig(b6[1]) !== null;
+  if (b6) return ipv6ToBig(b6[1]) !== null && (b6[2] === undefined || validPort(b6[2]));
   if ((e.match(/:/g) ?? []).length >= 2) return ipv6ToBig(e) !== null; // bare IPv6
-  return /^[a-z0-9_*.-]+(?::\d{1,5})?$/.test(e);
+  const hp = /^[a-z0-9_*.-]+(?::(\d{1,5}))?$/.exec(e);
+  return !!hp && (hp[1] === undefined || validPort(hp[1]));
+}
+
+function validPort(p: string): boolean {
+  const n = Number(p);
+  return Number.isInteger(n) && n >= 1 && n <= 65535;
+}
+
+/** Hosts in ::ffff:0:0/96 (mapped) and ::ffff:0:0:0/96 (translated) are matched as their embedded IPv4 address. */
+function embeddedV4(big: bigint): string | null {
+  const hi = big >> 32n;
+  if (hi !== 0xffffn && hi !== 0xffff0000n) return null;
+  const n = Number(big & 0xffffffffn);
+  return `${n >>> 24}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`;
+}
+
+/**
+ * parseTarget turns mapped IPv6 hosts into dotted IPv4, so an operator entry written in mapped form
+ * (::ffff:10.0.0.5, [::ffff:a00:5]:80, ::ffff:10.0.0.0/104) must be converted the same way or it can never match.
+ */
+function normalizeEntry(entry: string): string {
+  const c6 = /^([0-9a-f:.]*:[0-9a-f:.]*)\/(\d{1,3})$/i.exec(entry);
+  if (c6) {
+    const big = ipv6ToBig(c6[1]), bits = Number(c6[2]);
+    const v4 = big !== null && bits >= 96 ? embeddedV4(big) : null;
+    return v4 ? `${v4}/${bits - 96}` : entry;
+  }
+  const b6 = /^\[([0-9a-f:.]+)\](?::(\d+))?$/i.exec(entry);
+  const bare = !b6 && (entry.match(/:/g) ?? []).length >= 2 ? entry : null;
+  const addr = b6 ? b6[1] : bare;
+  const big = addr ? ipv6ToBig(addr) : null;
+  const v4 = big !== null ? embeddedV4(big) : null;
+  return v4 ? (b6 && b6[2] ? `${v4}:${b6[2]}` : v4) : entry;
+}
+
+/** Operator entries that will be refused (for a startup warning). Contains no secrets: entries are host patterns. */
+export function invalidDenyEntries(): string[] {
+  return (process.env.KUMA_MCP_DENY_HOSTS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean).filter((e) => !validEntry(e));
 }
 
 /**
@@ -150,7 +188,8 @@ function ipv6ToBig(h: string): bigint | null {
   return groups.reduce((a, g) => (a << 16n) | BigInt(parseInt(g || '0', 16)), 0n);
 }
 
-function entryMatches(entry: string, host: string, port: string): boolean {
+function entryMatches(rawEntry: string, host: string, port: string): boolean {
+  const entry = normalizeEntry(rawEntry);
   const cidr6 = /^([0-9a-f:]*:[0-9a-f:.]*)\/(\d{1,3})$/i.exec(entry);
   if (cidr6) {
     const ip = ipv6ToBig(host), base = ipv6ToBig(cidr6[1]), bits = Number(cidr6[2]);
@@ -174,11 +213,16 @@ function entryMatches(entry: string, host: string, port: string): boolean {
   const pBig = pat.includes(':') ? ipv6ToBig(pat) : null;
   if (pBig !== null) {
     const hBig = ipv6ToBig(host);
-    return hBig !== null && hBig === pBig && (wantPort === null || wantPort === port);
+    return hBig !== null && hBig === pBig && portOk(wantPort, port);
   }
   const re = new RegExp('^' + pat.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
   if (!re.test(host)) return false;
-  return wantPort === null || wantPort === port;
+  return portOk(wantPort, port);
+}
+
+/** Numeric compare: 08080 and 8080 are the same port. */
+function portOk(want: string | null, port: string): boolean {
+  return want === null || (port !== '' && Number(want) === Number(port));
 }
 
 /** Throw if url/hostname (optionally with port) hits the denylist or cannot be parsed (fail closed). */

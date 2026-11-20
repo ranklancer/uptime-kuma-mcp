@@ -5,6 +5,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { toolDefs } from './tools.js';
+import { invalidDenyEntries } from './policy.js';
 import { disconnectAll } from './instances.js';
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
@@ -171,6 +172,13 @@ const httpServer = http.createServer(async (req, res) => {
     sessions.set(newSessionId, { transport, server });
   }
 });
+
+{
+  const bad = invalidDenyEntries();
+  if (bad.length > 0) {
+    console.error(`WARNING: KUMA_MCP_DENY_HOSTS has invalid entries (monitor add/edit will fail until fixed): ${bad.join(', ')}`);
+  }
+}
 
 httpServer.listen(PORT, HOST, () => {
   console.log(`uptime-kuma-mcp listening on http://${HOST}:${PORT}`);

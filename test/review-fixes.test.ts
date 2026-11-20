@@ -10,7 +10,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { UptimeKumaClient, mergeGroups } from '../src/uptime-kuma-client.js';
 import { buildAddPayload, buildEditPayload, buildEditPayloadWithNotes } from '../src/payload.js';
-import { assertTargetAllowed } from '../src/policy.js';
+import { assertTargetAllowed, invalidDenyEntries } from '../src/policy.js';
 import { DESTINATION_REFUSAL } from '../src/redact.js';
 
 const { toolDefs } = await import('../src/tools.js');
@@ -405,4 +405,70 @@ test('R4-4 UI default ports are filled for dns/radius/snmp and used by the denyl
   assert.equal(buildAddPayload({ name: 'd', type: 'dns', hostname: 'a.example.test', port: 5353 }).port, 5353);
   process.env.KUMA_MCP_DENY_HOSTS = 'dns.internal:53';
   try { assert.throws(() => buildAddPayload({ name: 'd', type: 'dns', hostname: 'dns.internal' }), /not allowed/); } finally { delete process.env.KUMA_MCP_DENY_HOSTS; }
+});
+
+// ── Round 5 ─────────────────────────────────────────────────────────────────
+test('R5-a mapped-IPv6 deny entries match the mapped host (converted to IPv4 like the target)', () => {
+  process.env.KUMA_MCP_DENY_HOSTS = '::ffff:10.0.0.5, [::ffff:10.0.0.6]:8080, ::ffff:10.1.0.0/112, ::ffff:0:10.2.0.0/112';
+  try {
+    assert.throws(() => assertTargetAllowed({ url: 'http://[::ffff:10.0.0.5]/' }), /not allowed/);
+    assert.throws(() => assertTargetAllowed({ url: 'http://[::ffff:a00:5]/' }), /not allowed/);
+    assert.throws(() => assertTargetAllowed({ url: 'http://10.0.0.5/' }), /not allowed/);          // same host in plain IPv4
+    assert.throws(() => assertTargetAllowed({ url: 'http://[::ffff:10.0.0.6]:8080/' }), /not allowed/);
+    assert.doesNotThrow(() => assertTargetAllowed({ url: 'http://[::ffff:10.0.0.6]:9090/' }));
+    assert.throws(() => assertTargetAllowed({ url: 'http://[::ffff:10.1.0.77]/' }), /not allowed/);  // mapped CIDR /112 = IPv4 /16
+    assert.throws(() => assertTargetAllowed({ url: 'http://10.2.9.9/' }), /not allowed/);            // translated-form CIDR
+    assert.doesNotThrow(() => assertTargetAllowed({ url: 'http://10.3.0.1/' }));
+  } finally { delete process.env.KUMA_MCP_DENY_HOSTS; }
+});
+
+test('R5-b ports compare numerically (leading zeros)', () => {
+  process.env.KUMA_MCP_DENY_HOSTS = 'gw.lan:08080, [2001:db8::9]:080';
+  try {
+    assert.throws(() => assertTargetAllowed({ url: 'http://gw.lan:8080/' }), /not allowed/);
+    assert.throws(() => assertTargetAllowed({ hostname: 'gw.lan', port: 8080 }), /not allowed/);
+    assert.throws(() => assertTargetAllowed({ url: 'http://[2001:db8::9]:80/' }), /not allowed/);
+    assert.throws(() => assertTargetAllowed({ url: 'http://[2001:db8::9]/' }), /not allowed/); // default port 80
+    assert.doesNotThrow(() => assertTargetAllowed({ url: 'http://gw.lan:8081/' }));
+  } finally { delete process.env.KUMA_MCP_DENY_HOSTS; }
+});
+
+test('R5-c ports 0 and >65535 make an entry invalid', () => {
+  for (const bad of ['gw.lan:0', 'gw.lan:65536', 'gw.lan:99999', '[2001:db8::1]:0', '[2001:db8::1]:70000']) {
+    process.env.KUMA_MCP_DENY_HOSTS = bad;
+    try {
+      assert.deepEqual(invalidDenyEntries(), [bad]);
+      assert.throws(() => assertTargetAllowed({ hostname: 'example.test' }), /invalid entry/, bad);
+    } finally { delete process.env.KUMA_MCP_DENY_HOSTS; }
+  }
+  process.env.KUMA_MCP_DENY_HOSTS = 'gw.lan:65535,gw.lan:1';
+  try { assert.deepEqual(invalidDenyEntries(), []); } finally { delete process.env.KUMA_MCP_DENY_HOSTS; }
+});
+
+test('R5-N1 the merged-target denylist applies even with KUMA_MCP_ALLOW_WRITE_METHODS=1', () => {
+  process.env.KUMA_MCP_ALLOW_WRITE_METHODS = '1';
+  try {
+    const stale = { ...cur, type: 'ping', hostname: 'nas.example.test', url: 'http://169.254.169.254/latest/' };
+    assert.throws(() => buildEditPayload(stale, { type: 'http' }, 5), /not allowed/); // ping -> http activates the stale url
+    assert.doesNotThrow(() => buildEditPayload(stale, { hostname: 'nas2.example.test' }, 5)); // still ping: url irrelevant
+    assert.throws(() => buildEditPayload({ ...cur, url: 'http://localhost/' }, { ignoreTls: true }, 5), /not allowed/);
+  } finally { delete process.env.KUMA_MCP_ALLOW_WRITE_METHODS; }
+});
+
+test('R5-N2 edit fills the UI default port for dns/radius/snmp when null', () => {
+  const dns = { ...cur, type: 'dns', hostname: 'a.example.test', port: null };
+  assert.equal(buildEditPayload(dns, { name: 'n' }, 5).port, 53);
+  assert.equal(buildEditPayload({ ...dns, type: 'radius' }, { name: 'n' }, 5).port, 1812);
+  assert.equal(buildEditPayload({ ...dns, port: 5353 }, { name: 'n' }, 5).port, 5353);
+  process.env.KUMA_MCP_DENY_HOSTS = 'a.example.test:53';
+  try { assert.throws(() => buildEditPayload(dns, { ignoreTls: true }, 5), /not allowed/); } finally { delete process.env.KUMA_MCP_DENY_HOSTS; }
+});
+
+test('R5-N3 invalidDenyEntries lists bad entries for the startup warning; add/edit stay fail-closed', () => {
+  process.env.KUMA_MCP_DENY_HOSTS = 'good.lan:80, bad entry, 10.0.0.0/99';
+  try {
+    assert.deepEqual(invalidDenyEntries(), ['bad entry', '10.0.0.0/99']);
+    assert.throws(() => buildAddPayload({ name: 'x', url: 'https://a.example.test/' }), /invalid entry/);
+  } finally { delete process.env.KUMA_MCP_DENY_HOSTS; }
+  assert.deepEqual(invalidDenyEntries(), []);
 });

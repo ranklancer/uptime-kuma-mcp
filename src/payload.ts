@@ -196,6 +196,7 @@ export function buildEditPayloadWithNotes(
   const oldInterval = current.interval;
   const oldDerived = deriveTimeout(current.type, oldInterval);
   applyChanges(m, changes);
+  if ((m.port === undefined || m.port === null) && UI_DEFAULT_PORTS[m.type]) m.port = UI_DEFAULT_PORTS[m.type]; // as the UI does
   // Re-check the effective target when anything that shapes it changed.
   if (changes.url !== undefined || changes.hostname !== undefined || changes.port !== undefined || changes.dns_resolve_server !== undefined) {
     assertTargetAllowed({
@@ -209,9 +210,12 @@ export function buildEditPayloadWithNotes(
   // Re-check the merged result whenever anything that shapes the outgoing request changed (N1: also cap redirects).
   const shaping = ['url', 'hostname', 'port', 'type', 'method', 'body', 'headers', 'maxredirects', 'dns_resolve_server',
     'authMethod', 'basic_auth_user', 'basic_auth_pass', 'ignoreTls'];
-  if (!allowWriteMethods() && shaping.some((k) => changes[k] !== undefined)) {
+  const shapingChange = shaping.some((k) => changes[k] !== undefined);
+  // The denylist applies even when write methods are enabled: the monitor's EFFECTIVE target for its
+  // type must be allowed (a ping->http type change must not activate a stale url aimed at metadata).
+  if (shapingChange) assertTargetAllowed(effectiveTarget(m));
+  if (!allowWriteMethods() && shapingChange) {
     assertMethodAndBodyAllowed(m);
-      assertTargetAllowed(effectiveTarget(m));
     const before = Number(m.maxredirects) || 0;
     m.maxredirects = Math.min(before, MAX_REDIRECTS_SAFE);
     if (m.maxredirects !== before) {
