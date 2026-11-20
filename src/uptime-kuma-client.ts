@@ -1,6 +1,6 @@
 import { io, Socket } from 'socket.io-client';
 import type { KumaInstanceConfig, KumaSession, MonitorOpts } from './types.js';
-import { buildAddPayload, buildEditPayload, fingerprint } from './payload.js';
+import { buildAddPayload, buildEditPayloadWithNotes, fingerprint } from './payload.js';
 import {
   redactMonitorAck, redactHeartbeatAck, redactNotification, safeFailureText,
   assertMonitorEditAllowed, assertNotificationEditAllowed,
@@ -491,12 +491,14 @@ export class UptimeKumaClient {
     // H1: a monitor that holds credentials may not be repointed (Kuma would send the stored
     // credentials to the new destination on the next check). Compared against RAW values.
     assertMonitorEditAllowed(current.monitor, opts);
-    const merged = buildEditPayload(current.monitor, opts, monitorId);
+    const { payload: merged, notes } = buildEditPayloadWithNotes(current.monitor, opts, monitorId);
     const res = await this.request('editMonitor', merged);
     if (!res?.ok) {
       throw new Error(`[${this.cfg.name}] edit monitor failed: ${safeFailureText(res)}`);
     }
-    return redactMonitorAck(res);
+    const out = redactMonitorAck(res);
+    if (notes.length > 0 && out && typeof out === 'object') out.notes = notes;
+    return out;
   }
 
   /** Delete a monitor by ID. */

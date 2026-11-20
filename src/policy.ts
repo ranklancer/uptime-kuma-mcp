@@ -57,6 +57,8 @@ function ipv4ToInt(h: string): number | null {
 /** Only these URL schemes may be monitored targets (N3). */
 const ALLOWED_SCHEMES = ['http', 'https', 'ws', 'wss'];
 
+const DEFAULT_PORTS: Record<string, string> = { http: '80', ws: '80', https: '443', wss: '443' };
+
 function parseTarget(raw: string): { host: string; port: string } | null {
   let s = raw.trim();
   if (!s) return null;
@@ -65,13 +67,20 @@ function parseTarget(raw: string): { host: string; port: string } | null {
   if (sch && !ALLOWED_SCHEMES.includes(sch[1].toLowerCase())) return null; // file:, gopher:, ftp:, javascript:, ...
   try {
     const u = new URL(sch ? s : 'http://' + s);
-    let host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
-    const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+    // Collapse any run of trailing dots (localhost.. resolves like localhost).
+    let host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
+    // IPv4-mapped (::ffff:a:b) and IPv4-translated (::ffff:0:a:b) forms embed an IPv4 address.
+    const mapped = /^::ffff:(?:0:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
     if (mapped) {
       const a = parseInt(mapped[1], 16), b = parseInt(mapped[2], 16);
       host = `${a >> 8}.${a & 255}.${b >> 8}.${b & 255}`;
     }
-    return { host, port: u.port };
+    // URL drops the scheme's default port (:80/:443), so a host:port entry would never match: restore it.
+    // Scheme-less targets only count a port that was written explicitly.
+    let port = u.port;
+    if (!port && sch) port = DEFAULT_PORTS[sch[1].toLowerCase()] ?? '';
+    if (!port && !sch) { const m = /:(\d+)(?:[/?#]|$)/.exec(s.replace(/^\[[^\]]*\]/, '')); if (m) port = m[1]; }
+    return { host, port };
   } catch {
     return null;
   }
@@ -123,8 +132,12 @@ function entryMatches(entry: string, host: string, port: string): boolean {
 export function assertTargetAllowed(t: { url?: unknown; hostname?: unknown; port?: unknown; dns_resolve_server?: unknown }): void {
   const deny = denyList();
   const port = t.port !== undefined && t.port !== null ? String(t.port) : '';
-  for (const raw of [t.url, t.hostname, t.dns_resolve_server]) {
+  for (const [field, raw] of [['url', t.url], ['hostname', t.hostname], ['dns', t.dns_resolve_server]] as const) {
     if (typeof raw !== 'string' || raw === '') continue;
+    // A monitor `url` must carry an explicit http/https/ws/wss scheme (no scheme-less or relative forms).
+    if (field === 'url' && !/^(https?|wss?):\/\//i.test(raw.trim())) {
+      throw new Error('monitor target not allowed: url must start with http://, https://, ws:// or wss://');
+    }
     const p = parseTarget(raw);
     if (!p) throw new Error('monitor target not allowed: unparseable url/hostname or scheme not in http/https/ws/wss');
     const eff = p.port || port;

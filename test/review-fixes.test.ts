@@ -9,7 +9,7 @@ delete process.env.KUMA_MCP_DENY_HOSTS;
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { UptimeKumaClient, mergeGroups } from '../src/uptime-kuma-client.js';
-import { buildAddPayload, buildEditPayload } from '../src/payload.js';
+import { buildAddPayload, buildEditPayload, buildEditPayloadWithNotes } from '../src/payload.js';
 import { assertTargetAllowed } from '../src/policy.js';
 import { DESTINATION_REFUSAL } from '../src/redact.js';
 
@@ -267,7 +267,7 @@ test('N3 only http/https/ws/wss schemes are accepted', () => {
   for (const u of ['file:///etc/passwd', 'gopher://x.example.test/', 'ftp://x.example.test/', 'javascript:alert(1)', 'data:text/plain,x', 'dict://x.example.test:11211/', 'FILE:///x']) {
     assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, u);
   }
-  for (const u of ['http://x.example.test/', 'https://x.example.test/', 'ws://x.example.test/', 'WSS://x.example.test/', 'x.example.test:8080']) {
+  for (const u of ['http://x.example.test/', 'https://x.example.test/', 'ws://x.example.test/', 'WSS://x.example.test/']) {
     assert.doesNotThrow(() => assertTargetAllowed({ url: u }), u);
   }
   assert.throws(() => buildAddPayload({ name: 'x', url: 'gopher://x.example.test/' }), /not allowed/);
@@ -287,4 +287,75 @@ test('N5 delete_monitor / delete_notification require a matching confirmId', asy
     assert.equal(t.schema.safeParse({ [key]: 3 }).success, false, name);
     await assert.rejects(() => t.handler(t.schema.parse({ [key]: 3, confirmId: 4 })), /confirmId/, name);
   }
+});
+
+// ── Round 3 ─────────────────────────────────────────────────────────────────
+test('R3-1 host:port deny entries match URLs that use the scheme default port', () => {
+  process.env.KUMA_MCP_DENY_HOSTS = 'gw.internal:80,gw443.internal:443';
+  try {
+    for (const u of ['http://gw.internal/', 'http://gw.internal:80/', 'ws://gw.internal/', 'https://gw443.internal/', 'https://gw443.internal:443/x', 'wss://gw443.internal/']) {
+      assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, u);
+    }
+    assert.throws(() => assertTargetAllowed({ hostname: 'gw.internal:80' }), /not allowed/);
+    assert.throws(() => assertTargetAllowed({ hostname: 'gw.internal', port: 80 }), /not allowed/);
+    // other ports / the other scheme are not matched by a port-specific entry
+    assert.doesNotThrow(() => assertTargetAllowed({ url: 'http://gw443.internal/' }));
+    assert.doesNotThrow(() => assertTargetAllowed({ url: 'https://gw.internal/' }));
+    assert.doesNotThrow(() => assertTargetAllowed({ url: 'http://gw.internal:8080/' }));
+    assert.doesNotThrow(() => assertTargetAllowed({ hostname: 'gw.internal' }));
+  } finally { delete process.env.KUMA_MCP_DENY_HOSTS; }
+});
+
+test('R3-2 edit re-checks the MERGED target: a monitor already aimed at a denied host cannot take shaping edits', () => {
+  const bad = { ...cur, url: 'http://localhost:3000/' };
+  for (const ch of [{ headers: '{"A":"b"}' }, { type: 'keyword' }, { ignoreTls: true }, { maxredirects: 1 }]) {
+    assert.throws(() => buildEditPayload(bad, ch, 5), /not allowed/, JSON.stringify(ch));
+  }
+  assert.throws(() => buildEditPayload({ ...cur, type: 'port', hostname: '169.254.169.254', port: 80 }, { ignoreTls: true }, 5), /not allowed/);
+  assert.throws(() => buildEditPayload({ ...cur, type: 'dns', hostname: 'a.example.test', dns_resolve_server: '127.0.0.1' }, { type: 'dns', maxretries: 1, ignoreTls: true }, 5), /not allowed/);
+  assert.doesNotThrow(() => buildEditPayload(bad, { name: 'renamed' }, 5)); // non-shaping edit still fine
+  // placeholder url on ping/port monitors does not block edits; dns server ignored for non-dns types
+  assert.doesNotThrow(() => buildEditPayload({ ...cur, type: 'ping', url: 'https://', hostname: 'nas.example.test' }, { hostname: 'nas2.example.test' }, 5));
+  assert.doesNotThrow(() => buildEditPayload({ ...cur, type: 'port', url: 'https://', hostname: 'nas.example.test', port: 22, dns_resolve_server: '127.0.0.1' }, { port: 2222 }, 5));
+});
+
+test('R3-3 url requires an explicit http/https/ws/wss scheme (hostname stays scheme-optional)', () => {
+  for (const u of ['example.test', 'example.test:8080/x', '//example.test/', '/relative/path', 'example.test/health']) {
+    assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, u);
+  }
+  assert.throws(() => buildAddPayload({ name: 'x', url: 'example.test' }), /not allowed/);
+  assert.throws(() => buildEditPayload(cur, { url: 'example.test' }, 5), /not allowed/);
+  assert.doesNotThrow(() => assertTargetAllowed({ hostname: 'example.test' }));
+});
+
+test('R3-4 auth and TLS changes count as request-shaping for the merged-monitor checks', () => {
+  const post = { ...cur, method: 'POST' };
+  for (const ch of [{ authMethod: 'basic' }, { basic_auth_user: 'u' }, { basic_auth_pass: 'p' }, { ignoreTls: true }]) {
+    assert.throws(() => buildEditPayload(post, ch, 5), /method not allowed/, JSON.stringify(ch));
+  }
+});
+
+test('R3-5 a clamped maxredirects on edit is reported in notes', () => {
+  const r = buildEditPayloadWithNotes({ ...cur, maxredirects: 10 }, { url: 'https://o.example.test/' }, 5);
+  assert.equal(r.payload.maxredirects, 2);
+  assert.match(r.notes.join(' '), /maxredirects was reduced from 10 to 2/);
+  assert.deepEqual(buildEditPayloadWithNotes({ ...cur, maxredirects: 1 }, { url: 'https://o.example.test/' }, 5).notes, []);
+});
+
+test('R3-5b editMonitor surfaces the notes in its response', async () => {
+  const client: any = Object.create(UptimeKumaClient.prototype);
+  client.cfg = { name: 't' };
+  client.ensureConnected = async () => {};
+  client.emitWithAck = async (ev: string) => ev === 'getMonitor' ? { ok: true, monitor: { ...cur, maxredirects: 10 } } : { ok: true, msg: 'ok', monitorID: 5 };
+  const out = await client.editMonitor(5, { url: 'https://o.example.test/' });
+  assert.match(out.notes[0], /maxredirects was reduced/);
+});
+
+test('R3-6 repeated trailing dots and IPv4-translated IPv6 forms are normalised and refused', () => {
+  for (const u of ['http://localhost../', 'http://localhost.../', 'http://127.0.0.1../', 'http://[::ffff:0:7f00:1]/', 'http://[::ffff:7f00:1]/',
+    'http://[::ffff:0:a9fe:a9fe]/', 'http://bifrost../']) {
+    assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, u);
+  }
+  assert.throws(() => assertTargetAllowed({ hostname: 'localhost..' }), /not allowed/);
+  assert.doesNotThrow(() => assertTargetAllowed({ url: 'http://example.test../' }));
 });

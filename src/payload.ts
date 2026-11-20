@@ -168,11 +168,17 @@ export function buildAddPayload(rawOpts: Record<string, any>): Record<string, an
  * blank whatever is missing. Also repairs a missing/zero timeout the way the UI does, and
  * keeps an auto-derived timeout (80% of interval) in step when only the interval changes.
  */
-export function buildEditPayload(
+export function buildEditPayload(current: Record<string, any>, rawChanges: Record<string, any>, monitorId: number): Record<string, any> {
+  return buildEditPayloadWithNotes(current, rawChanges, monitorId).payload;
+}
+
+/** As buildEditPayload, plus human-readable notes about values the policy changed (shown to the caller). */
+export function buildEditPayloadWithNotes(
   current: Record<string, any>,
   rawChanges: Record<string, any>,
   monitorId: number,
-): Record<string, any> {
+): { payload: Record<string, any>; notes: string[] } {
+  const notes: string[] = [];
   const changes = sanitizeInput(rawChanges);
   assertMethodAndBodyAllowed(changes);
   const m: Record<string, any> = { ...current };
@@ -196,10 +202,22 @@ export function buildEditPayload(
   }
   // B1: the incoming-only check above misses an EXISTING POST/body monitor whose target is being changed.
   // Re-check the merged result whenever anything that shapes the outgoing request changed (N1: also cap redirects).
-  const shaping = ['url', 'hostname', 'port', 'type', 'method', 'body', 'headers', 'maxredirects', 'dns_resolve_server'];
+  const shaping = ['url', 'hostname', 'port', 'type', 'method', 'body', 'headers', 'maxredirects', 'dns_resolve_server',
+    'authMethod', 'basic_auth_user', 'basic_auth_pass', 'ignoreTls'];
   if (!allowWriteMethods() && shaping.some((k) => changes[k] !== undefined)) {
     assertMethodAndBodyAllowed(m);
-    m.maxredirects = Math.min(Number(m.maxredirects) || 0, MAX_REDIRECTS_SAFE);
+    // The monitor's EFFECTIVE target must be allowed too (a monitor already aimed at a denied host cannot be tweaked).
+    assertTargetAllowed({
+      url: typeof m.url === 'string' && m.url.trim() !== '' && m.url.trim() !== 'https://' ? m.url : undefined, // 'https://' is the UI placeholder
+      hostname: m.hostname,
+      port: m.port,
+      dns_resolve_server: m.type === 'dns' ? m.dns_resolve_server : undefined,
+    });
+    const before = Number(m.maxredirects) || 0;
+    m.maxredirects = Math.min(before, MAX_REDIRECTS_SAFE);
+    if (m.maxredirects !== before) {
+      notes.push(`maxredirects was reduced from ${before} to ${m.maxredirects} (policy cap while KUMA_MCP_ALLOW_WRITE_METHODS is off)`);
+    }
   }
   m.id = monitorId;
   if (!m.timeout) {
@@ -215,5 +233,5 @@ export function buildEditPayload(
   if (m.type === 'push' && !m.pushToken) {
     throw new Error('push monitor has no push token; refusing to edit (repair it in the Kuma UI)');
   }
-  return m;
+  return { payload: m, notes };
 }
