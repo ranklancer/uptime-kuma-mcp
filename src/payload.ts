@@ -115,6 +115,31 @@ export function normalizeStatusCodes(v: unknown): string[] | undefined {
   return out;
 }
 
+/**
+ * Explicit ports must be integers in 1-65535. 0 (and null/undefined) means "unset": the caller
+ * gets the type's UI default, else null. Port 0 is never a valid check target.
+ */
+function normalizePort(v: unknown): number | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null || v === 0) return null;
+  if (typeof v !== 'number' || !Number.isInteger(v) || v < 1 || v > 65535) {
+    throw new Error('port must be an integer between 1 and 65535 (0 or omitted = default)');
+  }
+  return v;
+}
+
+/**
+ * Fields that belong to one monitor type only. When `edit_monitor` changes the type, those of
+ * every group that does not belong to the NEW type are reset, so a stale grpc url, DSN, docker
+ * target or MQTT setting is neither sent on nor re-activated by a later type change.
+ */
+const TYPE_ONLY_FIELDS: Array<{ types: string[]; reset: Record<string, unknown> }> = [
+  { types: ['grpc'], reset: { grpcUrl: null, grpcProtobuf: null, grpcBody: null, grpcMetadata: null, grpcMethod: null, grpcServiceName: null, grpcEnableTls: false } },
+  { types: ['sqlserver', 'postgres', 'mysql', 'mongodb', 'redis'], reset: { databaseConnectionString: null, databaseQuery: null } },
+  { types: ['docker'], reset: { docker_container: '', docker_host: null } },
+  { types: ['mqtt'], reset: { mqttUsername: '', mqttPassword: '', mqttTopic: '', mqttSuccessMessage: '', mqttWebsocketPath: '', mqttCheckType: 'keyword' } },
+];
+
 /** Keys a caller can never set: the token is server-generated, active/ownership are not tool-controlled. */
 const FORBIDDEN_INPUT_KEYS = ['pushToken', 'active', 'user_id', 'id'];
 
@@ -147,6 +172,7 @@ function normalizeCommon(m: Record<string, any>): void {
  */
 export function buildAddPayload(rawOpts: Record<string, any>): Record<string, any> {
   const opts = sanitizeInput(rawOpts);
+  if ('port' in opts) opts.port = normalizePort(opts.port);
   assertMethodAndBodyAllowed(opts);
   assertTargetAllowed({
     ...opts,
@@ -185,9 +211,11 @@ export function buildEditPayloadWithNotes(
 ): { payload: Record<string, any>; notes: string[] } {
   const notes: string[] = [];
   const changes = sanitizeInput(rawChanges);
+  if ('port' in changes) changes.port = normalizePort(changes.port);
   assertMethodAndBodyAllowed(changes);
   const m: Record<string, any> = { ...current };
   for (const k of READ_ONLY_KEYS) delete m[k];
+  if (m.port === 0) m.port = null; // a stored 0 means unset; never forward it
   // Fill NOT NULL columns the server did not return (older/newer Kuma schema differences).
   const defaults = monitorDefaults();
   for (const k of ['conditions', 'kafkaProducerBrokers', 'kafkaProducerSaslOptions', 'rabbitmqNodes']) {
@@ -196,6 +224,9 @@ export function buildEditPayloadWithNotes(
   const oldInterval = current.interval;
   const oldDerived = deriveTimeout(current.type, oldInterval);
   applyChanges(m, changes);
+  if (changes.type !== undefined && changes.type !== current.type) {
+    for (const g of TYPE_ONLY_FIELDS) if (!g.types.includes(String(m.type))) Object.assign(m, g.reset);
+  }
   if ((m.port === undefined || m.port === null) && UI_DEFAULT_PORTS[m.type]) m.port = UI_DEFAULT_PORTS[m.type]; // as the UI does
   // Re-check the effective target when anything that shapes it changed.
   if (changes.url !== undefined || changes.hostname !== undefined || changes.port !== undefined || changes.dns_resolve_server !== undefined) {
