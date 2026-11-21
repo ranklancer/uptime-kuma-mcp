@@ -565,6 +565,8 @@ async function checkNotificationDestination(raw: string, resolve: Resolver | und
   }
   const sch = /^([a-z][a-z0-9+.-]*):\/\//i.exec(s);
   if (sch && !ALLOWED_SCHEMES.includes(sch[1].toLowerCase())) throw new Error('notification config not allowed: destination scheme must be http, https, ws or wss');
+  // Kuma's onebot/milky test startsWith("http") case-sensitively: only a lowercase http:// or https:// URL is used as written, anything else gets `http://` put in front (so `ws://x` or `Http://x` would be sent to host `ws` / `Http`).
+  if (sch && opts.schemeOptional && !/^https?:\/\//.test(s)) throw new Error('notification config not allowed: this field takes a lowercase http:// or https:// URL, or a bare host:port');
   if (!sch && opts.schemeOptional && /^http/i.test(s)) throw new Error('notification config not allowed: a value starting with "http" must be a full http:// or https:// URL (Kuma only adds a scheme to other values)');
   if (!sch && !opts.multi && !opts.schemeOptional && (/[/?#@\\]/.test(s) || /:\d/.test(s))) {
     // Without a scheme Kuma's HTTP client sends the request to localhost:80 (path = the whole value), not to the host written here.

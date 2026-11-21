@@ -685,3 +685,14 @@ test('R12 a scheme not followed by // is refused (http:/\\host%2e... slipped pas
   });
   for (const u of ['http:/\\x.example/', 'http:x.example/', 'http:80@x.example/', 'https:443@x.example']) assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, u);
 });
+
+test('R13 httpAddr with a non-lowercase-http scheme is refused (Kuma prefixes http:// to it); parseTarget rule on hostPort/relays', async () => {
+  await withEnv({ KUMA_MCP_NOTIFICATION_TYPES: 'onebot,nostr', KUMA_MCP_NOTIFICATION_HOSTS: 'x.example,x.example:443', KUMA_MCP_ALLOW_HOSTS: '*.example,x.example' }, async () => {
+    for (const v of ['ws://x.example/', 'wss://x.example:443/', 'Http://x.example/', 'HTTPS://x.example:443', 'WS://x.example'])
+      await assert.rejects(assertNotificationConfigAllowed({ type: 'onebot', httpAddr: v }, res({})), /lowercase http/, v);
+    await assertNotificationConfigAllowed({ type: 'onebot', httpAddr: 'https://x.example' }, res({}));
+    await assertNotificationConfigAllowed({ type: 'onebot', httpAddr: 'x.example:443' }, res({}));
+    for (const t of [{ hostPort: 'http:80@x.example:443' }, { hostPort: 'wss:443@x.example:443' }]) assert.throws(() => assertTargetAllowed(t), /not allowed/, JSON.stringify(t));
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'nostr', relays: 'wss:443@x.example:443' }, res({})), /not allowed/);
+  });
+});
