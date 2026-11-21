@@ -244,6 +244,7 @@ function parseTarget(raw: string): { host: string; port: string } | null {
   const sch = /^([a-z][a-z0-9+.-]*):(\/\/|(?!\d))/i.exec(s);
   if (sch && !ALLOWED_SCHEMES.includes(sch[1].toLowerCase())) return null; // file:, gopher:, ftp:, javascript:, ...
   if (sch && !/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) return null; // `http:/\x`, `http:x`: WHATWG repairs these, legacy parsers do not, and the raw-authority check below would look at the wrong text
+  if (/^(?:https?|wss?):(?!\/\/)/i.test(s)) return null; // `http:80@host` (the digit lookahead above makes it look scheme-less): legacy parsers read it as protocol http with no host -> localhost
   if (/[\t\r\n]/.test(s)) return null; // the URL parser would delete these, an older one would end the host there: refuse, do not strip
   try {
     // Check the RAW authority too: WHATWG percent-decodes the host (vaultwarden%2eattacker.example -> vaultwarden.attacker.example)
@@ -564,6 +565,7 @@ async function checkNotificationDestination(raw: string, resolve: Resolver | und
   }
   const sch = /^([a-z][a-z0-9+.-]*):\/\//i.exec(s);
   if (sch && !ALLOWED_SCHEMES.includes(sch[1].toLowerCase())) throw new Error('notification config not allowed: destination scheme must be http, https, ws or wss');
+  if (!sch && opts.schemeOptional && /^http/i.test(s)) throw new Error('notification config not allowed: a value starting with "http" must be a full http:// or https:// URL (Kuma only adds a scheme to other values)');
   if (!sch && !opts.multi && !opts.schemeOptional && (/[/?#@\\]/.test(s) || /:\d/.test(s))) {
     // Without a scheme Kuma's HTTP client sends the request to localhost:80 (path = the whole value), not to the host written here.
     throw new Error('notification config not allowed: a URL destination must start with http://, https://, ws:// or wss://');

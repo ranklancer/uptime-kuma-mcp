@@ -678,10 +678,10 @@ test('R11-S2 scheme-less host:port in a single-value URL field is refused (legac
 // ── review round 12 ─────────────────────────────────────────────────────────
 test('R12 a scheme not followed by // is refused (http:/\\host%2e... slipped past the raw-authority check via httpAddr)', async () => {
   await withEnv({ KUMA_MCP_NOTIFICATION_TYPES: 'onebot', KUMA_MCP_NOTIFICATION_HOSTS: '*.rebhahnomicon.com:443', KUMA_MCP_ALLOW_HOSTS: '*.rebhahnomicon.com', KUMA_MCP_DENY_HOSTS: 'vaultwarden' }, async () => {
-    for (const v of ['http:/\\vaultwarden%2erebhahnomicon.com:443', 'http:\\\\vaultwarden%2erebhahnomicon.com:443', 'https:/\\vaultwarden%2erebhahnomicon.com:443', 'http:vaultwarden.rebhahnomicon.com:443'])
+    for (const v of ['http:/\\vaultwarden%2erebhahnomicon.com:443', 'http:\\\\vaultwarden%2erebhahnomicon.com:443', 'https:/\\vaultwarden%2erebhahnomicon.com:443', 'http:vaultwarden.rebhahnomicon.com:443', 'http:80@x.rebhahnomicon.com:443', 'https:443@x.rebhahnomicon.com:443', 'http:1@x.rebhahnomicon.com:443/a', 'httpbin.rebhahnomicon.com:443'])
       await assert.rejects(assertNotificationConfigAllowed({ type: 'onebot', httpAddr: v }, res({})), /not allowed/, v);
     await assertNotificationConfigAllowed({ type: 'onebot', httpAddr: 'x.rebhahnomicon.com:443' }, res({}));
     await assertNotificationConfigAllowed({ type: 'onebot', httpAddr: 'https://x.rebhahnomicon.com' }, res({}));
   });
-  for (const u of ['http:/\\x.example/', 'http:x.example/']) assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, u);
+  for (const u of ['http:/\\x.example/', 'http:x.example/', 'http:80@x.example/', 'https:443@x.example']) assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, u);
 });
