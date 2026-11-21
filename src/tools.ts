@@ -123,21 +123,24 @@ function cronField(f: string, lo: number, hi: number): Set<number> | null {
   return out;
 }
 
-/** True if a cron window of `duration` minutes can silence alerts continuously for 23h+ (simulated over 8 days from a fixed Monday). Unreadable cron: true (fail closed). */
+/** True if a cron window of `duration` minutes can silence alerts continuously for 23h+ (simulated over a full leap year). Unreadable cron: true (fail closed). */
 function cronSilencesLong(expr: string, duration: number): boolean {
   const f = expr.trim().split(/\s+/);
   if (f.length !== 5) return true;
   const [mi, h, dom, mon, dow] = [cronField(f[0], 0, 59), cronField(f[1], 0, 23), cronField(f[2], 1, 31), cronField(f[3], 1, 12), cronField(f[4].replace(/7/g, '0'), 0, 6)];
   if (!mi || !h || !dom || !mon || !dow) return true;
-  const start = Date.UTC(2030, 0, 7); // a Monday
+  // Simulate a full leap year day by day (so month / day-of-month / weekday restrictions such as `* * 1 * *` or
+  // `* * * 6 *` are seen), starting one day early so a window that began before the horizon is counted.
+  const start = Date.UTC(2032, 0, 1);
+  const domStar = f[2] === '*', dowStar = f[4] === '*';
+  const times = [...h].sort((a, b) => a - b).flatMap((hr) => [...mi].sort((a, b) => a - b).map((m) => hr * 60 + m));
   const wins: Array<[number, number]> = [];
-  for (let t = -duration; t < 8 * 1440; t++) { // start one window early so a window that began before t=0 is counted
-    const d = new Date(start + t * 60000);
-    if (!mi.has(d.getUTCMinutes()) || !h.has(d.getUTCHours()) || !mon.has(d.getUTCMonth() + 1)) continue;
+  for (let day = -1; day <= 366; day++) {
+    const d = new Date(start + day * 86400000);
+    if (!mon.has(d.getUTCMonth() + 1)) continue;
     const domOk = dom.has(d.getUTCDate()), dowOk = dow.has(d.getUTCDay());
-    const domStar = f[2] === '*', dowStar = f[4] === '*';
     if (!(domStar || dowStar ? domOk && dowOk : domOk || dowOk)) continue; // cron: dom OR dow when both restricted
-    wins.push([t, t + duration]);
+    for (const tm of times) wins.push([day * 1440 + tm, day * 1440 + tm + duration]);
   }
   let cur: [number, number] | null = null;
   for (const w of wins) {

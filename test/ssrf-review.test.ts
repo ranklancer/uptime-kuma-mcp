@@ -4,6 +4,7 @@ process.env.KUMA_INSTANCES = 'kuma';
 process.env.KUMA_BASE_URL = 'http://kuma.test:3001';
 process.env.KUMA_USERNAME ??= 'u';
 process.env.KUMA_PASSWORD ??= 'p';
+process.env.KUMA_MCP_NOTIFICATION_HOSTS = '*'; // tests of the host list itself override this
 process.env.KUMA_MCP_NOTIFICATION_TYPES = 'ntfy,webhook,smtp,apprise,onebot,milky,nostr,pushover,serverchan,telegram,gotify,matrix,gorush,keep,pagertree,mattermost,brandnew,twilio';
 const { assertTargetAllowed, assertResolvedTargetAllowed, assertNotificationConfigAllowed, denyList } = await import('../src/policy.js');
 const { buildAddPayload, buildEditPayload } = await import('../src/payload.js');
@@ -372,4 +373,78 @@ test('R4 maintenance: long cron windows, manual always, durationMinutes >= 1380,
   const am = tool('uptimekuma_add_maintenance');
   for (const bad of [{ hours: 24, minutes: 0 }, { hours: 1, minutes: 60 }, { hours: -1, minutes: 0 }])
     assert.equal(am.schema.safeParse({ title: 't', strategy: 'recurring-weekday', timeRange: [bad, { hours: 3, minutes: 0 }] }).success, false);
+});
+
+// ── review round 4 ──────────────────────────────────────────────────────────
+test('R4-H1 KUMA_MCP_NOTIFICATION_HOSTS: default empty refuses every destination; listed hosts pass; denylist still wins', async () => {
+  await withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: '' }, async () => {
+    delete process.env.KUMA_MCP_NOTIFICATION_HOSTS; // unset = default (none)
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://ntfy.sh' }, res({ 'ntfy.sh': ['203.0.113.9'] })), /KUMA_MCP_NOTIFICATION_HOSTS/);
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'http://192.168.1.54:8015/api/x' }), /KUMA_MCP_NOTIFICATION_HOSTS/);
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'smtp', smtpHost: 'mail.example.com', smtpPort: 587 }, res({ 'mail.example.com': ['203.0.113.9'] })), /KUMA_MCP_NOTIFICATION_HOSTS/);
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'apprise', appriseURL: 'json://203.0.113.9/x' }), /KUMA_MCP_NOTIFICATION_HOSTS/);
+    await assertNotificationConfigAllowed({ type: 'apprise', appriseURL: 'tgram://123456:ABCdef/987' }); // fixed external service: exempt
+    await assertNotificationConfigAllowed({ type: 'ntfy', ntfytopic: 't' }); // no destination field set: nothing to list
+  });
+  await withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: 'ntfy.lan.example, 192.168.1.60:8080', KUMA_MCP_ALLOW_HOSTS: 'ntfy.lan.example' }, async () => {
+    await assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://ntfy.lan.example/' }, res({}));
+    await assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'http://192.168.1.60:8080/' });
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://ntfy.sh' }, res({ 'ntfy.sh': ['203.0.113.9'] })), /KUMA_MCP_NOTIFICATION_HOSTS/);
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'http://192.168.1.60:9999/' }), /KUMA_MCP_NOTIFICATION_HOSTS/);
+  });
+  // the list can never un-deny loopback / built-ins / operator deny entries
+  await withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: '*', KUMA_MCP_DENY_HOSTS: 'gw.lan:8080' }, async () => {
+    for (const u of ['http://127.0.0.1:8015/', 'http://localhost/', 'http://bifrost:8080/', 'http://gw.lan:8080/', 'http://169.254.169.254/'])
+      await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: u }), /denylist/, u);
+  });
+});
+
+test('R4-H1 templated ntfy/smtp/telegram body and title fields refused unless write methods are enabled (false/empty is fine)', async () => {
+  const base = { type: 'ntfy', ntfyserverurl: 'https://203.0.113.9/' };
+  for (const extra of [{ ntfyUseTemplate: true, ntfyCustomMessage: '{{ msg }} {{ monitorJSON.url }}' }, { ntfyCustomTitle: '{{ name }}' }, { ntfyCustomMessage: 'x' }, { ntfyUseTemplate: true }])
+    await assert.rejects(assertNotificationConfigAllowed({ ...base, ...extra }), /templated|ALLOW_WRITE_METHODS/, JSON.stringify(extra));
+  await assertNotificationConfigAllowed({ ...base, ntfyUseTemplate: false, ntfyCustomMessage: '', ntfyCustomTitle: '' });
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'smtp', smtpHost: '203.0.113.9', smtpPort: 25, customBody: '{{ msg }}' }), /ALLOW_WRITE_METHODS/);
+  await withEnv({ KUMA_MCP_ALLOW_WRITE_METHODS: '1' }, () => assertNotificationConfigAllowed({ ...base, ntfyUseTemplate: true, ntfyCustomMessage: '{{ msg }}' }));
+});
+
+test('R4-L1 cron confirm simulates a full year: month / day-of-month restricted every-minute windows are caught', () => {
+  const mk = (cron: string, durationMinutes = 1) => ({ monitorIds: [1], strategy: 'cron', cron, durationMinutes });
+  for (const c of ['* * * 6 *', '* * 1 * *', '* * 20 * *', '* * 29 2 *', '*/30 * 15 * *'])
+    assert.equal(maintenanceNeedsConfirm(mk(c, c.startsWith('*/30') ? 60 : 1)), true, c);
+  for (const c of ['0 3 * * *', '0 3 1 * *', '0 3 * 6 *', '*/5 3 * * 1']) assert.equal(maintenanceNeedsConfirm(mk(c, 30)), false, c);
+});
+
+test('R4-L1b cron windows >= 23h are confirmed without simulation (long durations, including monthly/yearly)', () => {
+  const mk = (cron: string, durationMinutes: number) => ({ monitorIds: [1], strategy: 'cron', cron, durationMinutes });
+  assert.equal(maintenanceNeedsConfirm(mk('0 3 * * *', 1380)), true);
+  assert.equal(maintenanceNeedsConfirm(mk('0 3 * * *', 1379)), false);
+  assert.equal(maintenanceNeedsConfirm(mk('0 0 1 * *', 44640)), true);
+});
+
+test('R4-L2 ntfy credential fields are not mistaken for hosts; real apprise token shapes parse', async () => {
+  await assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://203.0.113.9/', ntfyusername: 'john.doe', ntfypassword: 'Correct.Horse9', ntfyaccesstoken: 'tk_abc.def' });
+  await assertNotificationConfigAllowed({ type: 'apprise', appriseURL: 'tgram://123456:ABCdef/987' });
+  await assertNotificationConfigAllowed({ type: 'apprise', appriseURL: 'discord://1234567890/abc-DEF_ghi' });
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'apprise', appriseURL: 'tgram://[::1]:80/x' }), /denylist/);
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'apprise', appriseURL: 'slack://localhost/T/B/C' }), /denylist/);
+});
+
+test('R4 getHeartbeats: msg is withheld when the monitor type lookup fails (fail closed) and for echo types', async () => {
+  const { UptimeKumaClient } = await import('../src/uptime-kuma-client.js');
+  const mkClient = (monitor: () => any) => {
+    const c: any = Object.create(UptimeKumaClient.prototype);
+    c.cfg = { name: 't' }; c.ensureConnected = async () => {};
+    c.emitWithAck = async (ev: string) => {
+      if (ev === 'getMonitorBeats') return { ok: true, data: [{ status: 0, time: '2030-01-01 00:00:00', msg: 'Message: secret-payload-9' }] };
+      return monitor();
+    };
+    return c;
+  };
+  const failed = await mkClient(() => { throw new Error('socket gone'); }).getHeartbeats(1);
+  assert.ok(!JSON.stringify(failed).includes('secret-payload-9'), 'lookup failure must withhold msg');
+  const mqtt = await mkClient(() => ({ ok: true, monitor: { id: 1, type: 'mqtt' } })).getHeartbeats(1);
+  assert.ok(!JSON.stringify(mqtt).includes('secret-payload-9'));
+  const http = await mkClient(() => ({ ok: true, monitor: { id: 1, type: 'http' } })).getHeartbeats(1);
+  assert.ok(JSON.stringify(http).includes('secret-payload-9')); // ordinary types keep msg
 });

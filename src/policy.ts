@@ -373,6 +373,28 @@ export async function assertResolvedTargetAllowed(
 
 // ── Notification provider config (H1) ───────────────────────────────────────
 
+/**
+ * Hosts a notification provider may send to (KUMA_MCP_NOTIFICATION_HOSTS: exact hosts, `*` globs or CIDRs).
+ * DEFAULT EMPTY: every notification destination is refused until the operator lists it. A notification sends
+ * agent-influenced content (monitor name/url, heartbeat text) on every status change, so a public destination is an
+ * exfiltration channel even when the internal denylist passes it. The denylist still applies on top of this list.
+ * A redirect from the destination is an unchecked second hop: keep this list tight (the operator's own ntfy host).
+ */
+export function notificationHosts(): string[] {
+  return envEntries('KUMA_MCP_NOTIFICATION_HOSTS').filter(validEntry);
+}
+
+export function invalidNotificationHostEntries(): string[] {
+  return envEntries('KUMA_MCP_NOTIFICATION_HOSTS').filter((e) => !validEntry(e));
+}
+
+function assertNotificationHostListed(raw: string): void {
+  const p = parseTarget(raw);
+  if (!p || !p.host || !notificationHosts().some((e) => entryMatches(e, p.host, p.port))) {
+    throw new Error('notification config not allowed: the destination host is not listed in KUMA_MCP_NOTIFICATION_HOSTS on the MCP server (default: none)');
+  }
+}
+
 /** Destination spec for a provider type: single/multi-value fields holding a URL or host, host+port pairs, and known non-destination fields. */
 interface NotifDest { keys?: string[]; multi?: string[]; pair?: [string, string]; skip?: string[] }
 
@@ -392,7 +414,7 @@ export function enabledNotificationTypes(): string[] {
  * unexpected destination field cannot be used to smuggle a target. Keys are Kuma's provider type ids, lower-cased.
  */
 const NOTIF_TYPES = new Map<string, NotifDest>(Object.entries({
-  webhook: { keys: ['webhookURL'] }, ntfy: { keys: ['ntfyserverurl'], skip: ['ntfyIcon'] }, gotify: { keys: ['gotifyserverurl'] },
+  webhook: { keys: ['webhookURL'] }, ntfy: { keys: ['ntfyserverurl'], skip: ['ntfyIcon', 'ntfyusername', 'ntfypassword', 'ntfyaccesstoken'] }, gotify: { keys: ['gotifyserverurl'] },
   slack: { keys: ['slackwebhookURL'] }, discord: { keys: ['discordWebhookUrl'] }, teams: { keys: ['webhookUrl'] },
   telegram: { keys: ['telegramServerUrl'] }, smtp: { pair: ['smtpHost', 'smtpPort'], skip: ['smtpDkimDomain', 'smtpDkimKeySelector'] },
   apprise: { keys: ['appriseURL'] },
@@ -411,7 +433,8 @@ const NOTIF_TYPES = new Map<string, NotifDest>(Object.entries({
 } as Record<string, NotifDest>));
 const NOTIF_RESERVED = new Set(['name', 'type', 'isDefault', 'applyExisting', 'active', 'id', 'userId']);
 /** Webhook free-form request shaping: refused unless the operator allows write-style requests. */
-const NOTIF_REQUEST_SHAPING_KEYS = ['webhookCustomBody', 'webhookAdditionalHeaders'];
+const NOTIF_REQUEST_SHAPING_KEYS = ['webhookCustomBody', 'webhookAdditionalHeaders', 'ntfyUseTemplate', 'ntfyCustomTitle', 'ntfyCustomMessage',
+  'customSubject', 'customBody', 'telegramUseTemplate', 'telegramTemplate'];
 /** apprise schemes that are HTTP requests under the hood: checked exactly like http(s). */
 const APPRISE_HTTP_SCHEMES: Record<string, string> = { json: 'http', jsons: 'https', xml: 'http', xmls: 'https', form: 'http', forms: 'https', http: 'http', https: 'https' };
 /** apprise schemes whose "host" part is a token/id, not a network host: only the literal denylist applies. Any other scheme is refused. */
@@ -453,12 +476,14 @@ async function checkNotificationDestination(raw: string, resolve: Resolver | und
     const sc = m[1].toLowerCase();
     if (APPRISE_HTTP_SCHEMES[sc]) {
       const url = APPRISE_HTTP_SCHEMES[sc] + s.slice(sc.length);
-      assertTargetAllowed({ url }); await assertResolvedTargetAllowed({ url }, resolve); return;
+      assertTargetAllowed({ url }); assertNotificationHostListed(url); await assertResolvedTargetAllowed({ url }, resolve); return;
     }
     if (!APPRISE_TOKEN_SCHEMES.includes(sc)) throw new Error(`notification config not allowed: apprise scheme "${sc.slice(0, 20)}" is not supported (its host part is a real network host or unknown)`);
-    let u: URL;
-    try { u = new URL(s); } catch { throw new Error('notification config not allowed: unparseable URL'); }
-    if (u.host) assertTargetAllowed({ hostPort: u.host }); // u.host keeps IPv6 brackets and the port
+    // The host part of a token scheme is usually a bot token / id (`tgram://123456:ABCdef/987`), which is not a valid
+    // authority; only a part that is a valid bare host or bracketed IPv6 literal is run through the denylist.
+    const auth = s.slice(m[0].length).split(/[/?#]/)[0].replace(/^.*@/, '');
+    const hostOnly = auth.startsWith('[') ? auth.slice(0, auth.indexOf(']') + 1) : auth.split(':')[0];
+    if (/^\[[0-9a-f:.]+\]$/i.test(hostOnly) || (/^[a-z0-9_.-]+$/i.test(hostOnly) && !/^\d+$/.test(hostOnly))) assertTargetAllowed({ hostname: hostOnly }); // an all-digit token is not a decimal IP
     return;
   }
   const sch = /^([a-z][a-z0-9+.-]*):\/\//i.exec(s);
@@ -466,9 +491,11 @@ async function checkNotificationDestination(raw: string, resolve: Resolver | und
   if (sch || /[/?#@]/.test(s)) {
     const url = sch ? s : 'http://' + s;
     assertTargetAllowed({ url });
+    assertNotificationHostListed(url);
     await assertResolvedTargetAllowed({ url }, resolve);
   } else {
     assertTargetAllowed({ hostPort: s });
+    assertNotificationHostListed(s);
     await assertResolvedTargetAllowed({ hostPort: s }, resolve);
   }
 }
@@ -491,8 +518,8 @@ export async function assertNotificationConfigAllowed(config: Record<string, unk
   if (!allowWriteMethods()) {
     for (const k of NOTIF_REQUEST_SHAPING_KEYS) {
       const v = config[k];
-      if (v !== undefined && v !== null && v !== '') {
-        throw new Error('notification config not allowed: a custom webhook body or additional headers needs KUMA_MCP_ALLOW_WRITE_METHODS=1 on the MCP server');
+      if (v !== undefined && v !== null && v !== '' && v !== false && v !== 0) {
+        throw new Error('notification config not allowed: a custom/templated body, title or additional headers needs KUMA_MCP_ALLOW_WRITE_METHODS=1 on the MCP server');
       }
     }
     // Kuma's webhook sends POST for a missing httpMethod and for HEAD, so only an explicit GET is read-only.
@@ -523,6 +550,7 @@ export async function assertNotificationConfigAllowed(config: Record<string, unk
       const port = rawPort === undefined || rawPort === null || rawPort === '' ? undefined : Number(rawPort);
       if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new Error('notification config not allowed: invalid port');
       assertTargetAllowed({ hostname: host, port }); // host and port are judged together (host:port deny entries)
+      assertNotificationHostListed(`${host.includes(':') ? `[${host.replace(/^\[|\]$/g, '')}]` : host}${port !== undefined ? ':' + port : ''}`);
       await assertResolvedTargetAllowed({ hostname: host, port }, resolve);
     }
   }
