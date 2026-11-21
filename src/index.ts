@@ -143,7 +143,7 @@ const httpServer = http.createServer(async (req, res) => {
   }
   const badNotif = invalidNotificationHostEntries();
   if (badNotif.length > 0) {
-    console.error(`WARNING: KUMA_MCP_NOTIFICATION_HOSTS has invalid entries (ignored, so those destinations are refused): ${badNotif.join(', ')}`);
+    console.error(`WARNING: KUMA_MCP_NOTIFICATION_HOSTS has invalid entries (ignored, so those destinations are refused; only an exact host, *.suffix or [ipv6], with an optional :port, is accepted): ${badNotif.join(', ')}`);
   }
   const badAllow = invalidAllowEntries();
   if (badAllow.length > 0) {

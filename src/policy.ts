@@ -380,18 +380,42 @@ export async function assertResolvedTargetAllowed(
  * exfiltration channel even when the internal denylist passes it. The denylist still applies on top of this list.
  * A redirect from the destination is an unchecked second hop: keep this list tight (the operator's own ntfy host).
  */
+/**
+ * Entry grammar for KUMA_MCP_NOTIFICATION_HOSTS, deliberately narrower than the denylist's: an exact host / IPv4 / [IPv6],
+ * or `*.suffix` (whole leading labels only), each with an optional `:port`. Bare `*`, other globs and CIDRs are not
+ * accepted (they are logged at startup and ignored). A portless entry means the scheme's DEFAULT port only.
+ */
+function parseNotificationHostEntry(e: string): { host: string; port?: string; glob: boolean } | null {
+  const m = /^(?:\[([0-9a-f:.]+)\]|(\*\.)?([a-z0-9_-]+(?:\.[a-z0-9_-]+)*))(?::(\d{1,5}))?$/i.exec(e);
+  if (!m) return null;
+  if (m[4] !== undefined && !validPort(m[4])) return null;
+  const host = (m[1] ?? m[3]).toLowerCase();
+  if (m[1] !== undefined && ipv6ToBig(host) === null) return null;
+  return { host, port: m[4] === undefined ? undefined : String(Number(m[4])), glob: !!m[2] };
+}
+
 export function notificationHosts(): string[] {
-  return envEntries('KUMA_MCP_NOTIFICATION_HOSTS').filter(validEntry);
+  return envEntries('KUMA_MCP_NOTIFICATION_HOSTS').filter((e) => parseNotificationHostEntry(e) !== null);
 }
 
 export function invalidNotificationHostEntries(): string[] {
-  return envEntries('KUMA_MCP_NOTIFICATION_HOSTS').filter((e) => !validEntry(e));
+  return envEntries('KUMA_MCP_NOTIFICATION_HOSTS').filter((e) => parseNotificationHostEntry(e) === null);
 }
+
+const SCHEME_DEFAULT_PORT: Record<string, string> = { http: '80', ws: '80', https: '443', wss: '443' };
 
 function assertNotificationHostListed(raw: string): void {
   const p = parseTarget(raw);
-  if (!p || !p.host || !notificationHosts().some((e) => entryMatches(e, p.host, p.port))) {
-    throw new Error('notification config not allowed: the destination host is not listed in KUMA_MCP_NOTIFICATION_HOSTS on the MCP server (default: none)');
+  const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(raw.trim())?.[1].toLowerCase();
+  const ok = !!p && !!p.host && notificationHosts().some((entry) => {
+    const e = parseNotificationHostEntry(entry)!;
+    const hostOk = e.glob ? p.host.endsWith('.' + e.host) : (ipv6ToBig(e.host) !== null && ipv6ToBig(p.host) !== null ? ipv6ToBig(e.host) === ipv6ToBig(p.host) : e.host === p.host);
+    // A portless entry allows only the scheme's default port; a destination without a scheme needs an entry with a port.
+    const portOk = e.port !== undefined ? p.port !== '' && Number(p.port) === Number(e.port) : scheme !== undefined && SCHEME_DEFAULT_PORT[scheme] !== undefined && p.port === SCHEME_DEFAULT_PORT[scheme];
+    return hostOk && portOk;
+  });
+  if (!ok) {
+    throw new Error('notification config not allowed: the destination host and port are not listed in KUMA_MCP_NOTIFICATION_HOSTS on the MCP server (default: none; an entry without a port allows only the default http/https port)');
   }
 }
 
@@ -414,7 +438,7 @@ export function enabledNotificationTypes(): string[] {
  * unexpected destination field cannot be used to smuggle a target. Keys are Kuma's provider type ids, lower-cased.
  */
 const NOTIF_TYPES = new Map<string, NotifDest>(Object.entries({
-  webhook: { keys: ['webhookURL'] }, ntfy: { keys: ['ntfyserverurl'], skip: ['ntfyIcon', 'ntfyusername', 'ntfypassword', 'ntfyaccesstoken'] }, gotify: { keys: ['gotifyserverurl'] },
+  webhook: { keys: ['webhookURL'] }, ntfy: { keys: ['ntfyserverurl', 'ntfyIcon'], skip: ['ntfyusername', 'ntfypassword', 'ntfyaccesstoken'] }, gotify: { keys: ['gotifyserverurl'] },
   slack: { keys: ['slackwebhookURL'] }, discord: { keys: ['discordWebhookUrl'] }, teams: { keys: ['webhookUrl'] },
   telegram: { keys: ['telegramServerUrl'] }, smtp: { pair: ['smtpHost', 'smtpPort'], skip: ['smtpDkimDomain', 'smtpDkimKeySelector'] },
   apprise: { keys: ['appriseURL'] },
@@ -434,7 +458,7 @@ const NOTIF_TYPES = new Map<string, NotifDest>(Object.entries({
 const NOTIF_RESERVED = new Set(['name', 'type', 'isDefault', 'applyExisting', 'active', 'id', 'userId']);
 /** Webhook free-form request shaping: refused unless the operator allows write-style requests. */
 const NOTIF_REQUEST_SHAPING_KEYS = ['webhookCustomBody', 'webhookAdditionalHeaders', 'ntfyUseTemplate', 'ntfyCustomTitle', 'ntfyCustomMessage',
-  'customSubject', 'customBody', 'telegramUseTemplate', 'telegramTemplate'];
+  'customSubject', 'customBody', 'telegramUseTemplate', 'telegramTemplate', 'ntfyCall'];
 /** apprise schemes that are HTTP requests under the hood: checked exactly like http(s). */
 const APPRISE_HTTP_SCHEMES: Record<string, string> = { json: 'http', jsons: 'https', xml: 'http', xmls: 'https', form: 'http', forms: 'https', http: 'http', https: 'https' };
 /** apprise schemes whose "host" part is a token/id, not a network host: only the literal denylist applies. Any other scheme is refused. */
@@ -525,6 +549,12 @@ export async function assertNotificationConfigAllowed(config: Record<string, unk
     // Kuma's webhook sends POST for a missing httpMethod and for HEAD, so only an explicit GET is read-only.
     if (type === 'webhook' && String(config.httpMethod ?? '').trim().toLowerCase() !== 'get') {
       throw new Error('notification config not allowed: a webhook must set httpMethod to GET unless KUMA_MCP_ALLOW_WRITE_METHODS=1');
+    }
+  }
+  if (type === 'ntfy' && process.env.KUMA_MCP_NTFY_TOPICS !== undefined) {
+    const topics = process.env.KUMA_MCP_NTFY_TOPICS.split(',').map((x) => x.trim()).filter(Boolean);
+    if (topics.length > 0 && !(typeof config.ntfytopic === 'string' && topics.includes(config.ntfytopic))) {
+      throw new Error('notification config not allowed: the ntfy topic is not listed in KUMA_MCP_NTFY_TOPICS on the MCP server');
     }
   }
   const known = new Set<string>([...(spec.keys ?? []), ...(spec.multi ?? []), ...(spec.pair ?? []), ...(spec.skip ?? [])]);

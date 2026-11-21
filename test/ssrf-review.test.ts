@@ -4,9 +4,9 @@ process.env.KUMA_INSTANCES = 'kuma';
 process.env.KUMA_BASE_URL = 'http://kuma.test:3001';
 process.env.KUMA_USERNAME ??= 'u';
 process.env.KUMA_PASSWORD ??= 'p';
-process.env.KUMA_MCP_NOTIFICATION_HOSTS = '*'; // tests of the host list itself override this
+process.env.KUMA_MCP_NOTIFICATION_HOSTS = '203.0.113.9,203.0.113.9:80,203.0.113.9:25,203.0.113.9:587,*.example,*.example.com,*.test,rebind.example:8015,192.168.1.54:587'; // tests of the host list itself override this
 process.env.KUMA_MCP_NOTIFICATION_TYPES = 'ntfy,webhook,smtp,apprise,onebot,milky,nostr,pushover,serverchan,telegram,gotify,matrix,gorush,keep,pagertree,mattermost,brandnew,twilio';
-const { assertTargetAllowed, assertResolvedTargetAllowed, assertNotificationConfigAllowed, denyList } = await import('../src/policy.js');
+const { assertTargetAllowed, assertResolvedTargetAllowed, assertNotificationConfigAllowed, denyList, invalidNotificationHostEntries } = await import('../src/policy.js');
 const { buildAddPayload, buildEditPayload } = await import('../src/payload.js');
 const { sanitizeHeartbeatMsg } = await import('../src/redact.js');
 const { toolDefs, maintenanceNeedsConfirm } = await import('../src/tools.js');
@@ -294,7 +294,7 @@ test('allow-list never un-denies loopback, built-in names or KUMA_MCP_DENY_HOSTS
 // ── review round 3 ──────────────────────────────────────────────────────────
 test('R3 type allow-list: default is ntfy only; other types and type changes need KUMA_MCP_NOTIFICATION_TYPES', async () => {
   await withEnv({ KUMA_MCP_NOTIFICATION_TYPES: '' }, async () => { delete process.env.KUMA_MCP_NOTIFICATION_TYPES; // unset = default
-    await assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://203.0.113.9/', ntfyAuthenticationMethod: 'none', ntfyIcon: 'https://x.example/i.png' });
+    await assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://203.0.113.9/', ntfyAuthenticationMethod: 'none', ntfyIcon: 'https://203.0.113.9/i.png' });
     for (const t of ['webhook', 'apprise', 'gotify', 'smtp', 'slack']) await assert.rejects(assertNotificationConfigAllowed({ type: t }), /KUMA_MCP_NOTIFICATION_TYPES/, t);
   });
   const { UptimeKumaClient } = await import('../src/uptime-kuma-client.js');
@@ -342,7 +342,7 @@ test('R2 keep/pagertree destination keys; control and hidden characters in a des
 });
 
 test('N2/N3 ntfy defaults work (ntfyAuthenticationMethod is not a method); known non-destination keys are skipped', async () => {
-  await assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://203.0.113.9/', ntfyAuthenticationMethod: 'usernamePassword', ntfyIcon: 'https://x.example/i.png', ntfytopic: 'alerts', ntfyPriority: 5 });
+  await assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://203.0.113.9/', ntfyAuthenticationMethod: 'usernamePassword', ntfyIcon: 'https://203.0.113.9/i.png', ntfytopic: 'alerts', ntfyPriority: 5 });
   await assertNotificationConfigAllowed({ type: 'mattermost', mattermostWebhookUrl: 'https://203.0.113.9/h', mattermosticonurl: 'https://x.example/i.png' });
   await assertNotificationConfigAllowed({ type: 'smtp', smtpHost: '203.0.113.9', smtpPort: 587, smtpDkimDomain: 'example.com' });
   await assertNotificationConfigAllowed({ type: 'gorush', gorushServerURL: 'https://203.0.113.9/', gorushTopic: 'com.example.app' });
@@ -447,4 +447,59 @@ test('R4 getHeartbeats: msg is withheld when the monitor type lookup fails (fail
   assert.ok(!JSON.stringify(mqtt).includes('secret-payload-9'));
   const http = await mkClient(() => ({ ok: true, monitor: { id: 1, type: 'http' } })).getHeartbeats(1);
   assert.ok(JSON.stringify(http).includes('secret-payload-9')); // ordinary types keep msg
+});
+
+// ── review round 5 ──────────────────────────────────────────────────────────
+test('R5-1 NOTIFICATION_HOSTS: a portless entry allows only the scheme default port; globs are whole labels; no bare * or CIDR', async () => {
+  const ntfy = (u: string) => assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: u }, res({}));
+  await withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: 'ntfy.lan.example,192.168.1.60,*.svc.example,192.168.1.0/24,*lan.example,*', KUMA_MCP_ALLOW_HOSTS: '*.example,192.168.1.60,192.168.1.54' }, async () => {
+    await ntfy('https://ntfy.lan.example/');                                       // portless entry: scheme default port
+    await ntfy('https://ntfy.lan.example:443/');
+    await ntfy('http://ntfy.lan.example/');                                        // (80 for http)
+    await assert.rejects(ntfy('http://ntfy.lan.example:8015/'), /NOTIFICATION_HOSTS/);
+    await assert.rejects(ntfy('https://ntfy.lan.example:9999/'), /NOTIFICATION_HOSTS/);
+    await assert.rejects(ntfy('http://192.168.1.60:8015/'), /NOTIFICATION_HOSTS/);
+    await ntfy('http://192.168.1.60/');
+    await assert.rejects(ntfy('http://192.168.1.54:8015/'), /NOTIFICATION_HOSTS/);  // bare CIDR entry is ignored
+    await assert.rejects(ntfy('https://evillan.example/'), /NOTIFICATION_HOSTS/);   // *lan.example is not accepted
+    await assert.rejects(ntfy('https://other.example/'), /NOTIFICATION_HOSTS/);     // bare * is not accepted
+    await ntfy('https://a.svc.example/');                                           // *.suffix still works
+    await assert.rejects(ntfy('https://svc.example/'), /NOTIFICATION_HOSTS/);       // needs at least one label before the suffix
+    await assert.rejects(ntfy('https://x.evil-svc.example/'), /NOTIFICATION_HOSTS/);
+  });
+  withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: '*,192.168.1.0/24,*lan.example,ok.example:70000,ok.example,*.ok.example:8080,[2001:db8::5]:443' }, () => {
+    assert.deepEqual(invalidNotificationHostEntries(), ['*', '192.168.1.0/24', '*lan.example', 'ok.example:70000']);
+  });
+});
+
+test('R5-5 a scheme-less host:port destination (hostPort branch) must be listed WITH its port; portless entries do not match it', async () => {
+  const gotify = (v: string) => assertNotificationConfigAllowed({ type: 'gotify', gotifyserverurl: v }, res({}));
+  await withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: 'g.example:8080,h.example', KUMA_MCP_ALLOW_HOSTS: '*.example' }, async () => {
+    await gotify('g.example:8080');
+    await assert.rejects(gotify('g.example:9090'), /NOTIFICATION_HOSTS/);
+    await assert.rejects(gotify('other.example:8080'), /NOTIFICATION_HOSTS/);
+    await assert.rejects(gotify('h.example'), /NOTIFICATION_HOSTS/);          // no scheme, no port: no default to rely on
+    await assert.rejects(gotify('h.example:8080'), /NOTIFICATION_HOSTS/);      // portless entry only covers a scheme's default port
+  });
+});
+
+test('R5-2 KUMA_MCP_NTFY_TOPICS (optional) restricts the ntfy topic; unset = no restriction', async () => {
+  const t = (ntfytopic?: string) => assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://203.0.113.9/', ...(ntfytopic === undefined ? {} : { ntfytopic }) });
+  await t('anything');
+  await withEnv({ KUMA_MCP_NTFY_TOPICS: 'kuma-alerts, kuma-info' }, async () => {
+    await t('kuma-alerts'); await t('kuma-info');
+    await assert.rejects(t('someone-elses-topic'), /KUMA_MCP_NTFY_TOPICS/);
+    await assert.rejects(t(), /KUMA_MCP_NTFY_TOPICS/);
+  });
+});
+
+test('R5-4 ntfyIcon goes through the host list and denylist; ntfyCall needs write methods', async () => {
+  const base = { type: 'ntfy', ntfyserverurl: 'https://203.0.113.9/' };
+  await assert.rejects(assertNotificationConfigAllowed({ ...base, ntfyIcon: 'http://127.0.0.1:8015/i.png' }), /denylist/);
+  await assert.rejects(assertNotificationConfigAllowed({ ...base, ntfyIcon: 'https://tracker.example.net/i.png' }, res({ 'tracker.example.net': ['203.0.113.7'] })), /NOTIFICATION_HOSTS/);
+  await assertNotificationConfigAllowed({ ...base, ntfyIcon: 'https://203.0.113.9/i.png' });
+  await assertNotificationConfigAllowed({ ...base, ntfyIcon: '' });
+  await assert.rejects(assertNotificationConfigAllowed({ ...base, ntfyCall: '+15551234567' }), /ALLOW_WRITE_METHODS/);
+  await assertNotificationConfigAllowed({ ...base, ntfyCall: '' });
+  await withEnv({ KUMA_MCP_ALLOW_WRITE_METHODS: '1' }, () => assertNotificationConfigAllowed({ ...base, ntfyCall: '+15551234567' }));
 });

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 process.env.KUMA_MCP_NOTIFICATION_TYPES = 'ntfy,pushover,pushbullet';
-process.env.KUMA_MCP_NOTIFICATION_HOSTS = '*';
+process.env.KUMA_MCP_NOTIFICATION_HOSTS = '203.0.113.9,203.0.113.9:80,203.0.113.9:25,203.0.113.9:587,*.example,*.example.com,*.test'; // tests of the host list itself override this
 process.env.KUMA_MCP_ALLOW_HOSTS = '*'; // these tests use fictional names the system resolver cannot see
 import {
   scrubUrl, redactMonitor, redactNotification, redactHeartbeatAck, sanitizeHeartbeatMsg,
