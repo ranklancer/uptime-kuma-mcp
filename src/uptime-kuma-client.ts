@@ -1,6 +1,7 @@
 import { io, Socket } from 'socket.io-client';
 import type { KumaInstanceConfig, KumaSession, MonitorOpts } from './types.js';
 import { buildAddPayload, buildEditPayloadWithNotes, fingerprint } from './payload.js';
+import { assertResolvedTargetAllowed, effectiveTarget } from './policy.js';
 import {
   redactMonitorAck, redactHeartbeatAck, redactNotification, safeFailureText,
   assertMonitorEditAllowed, assertNotificationEditAllowed,
@@ -481,6 +482,7 @@ export class UptimeKumaClient {
   async addMonitor(opts: MonitorOpts): Promise<any> {
     await this.ensureConnected();
     const monitorData = buildAddPayload(opts);
+    await assertResolvedTargetAllowed(effectiveTarget(monitorData));
     const res = await this.request('add', monitorData);
     if (!res?.ok) {
       throw new Error(`[${this.cfg.name}] add monitor failed: ${safeFailureText(res)}`);
@@ -508,6 +510,9 @@ export class UptimeKumaClient {
     // credentials to the new destination on the next check). Compared against RAW values.
     assertMonitorEditAllowed(current.monitor, opts);
     const { payload: merged, notes } = buildEditPayloadWithNotes(current.monitor, opts, monitorId);
+    if (['url', 'hostname', 'port', 'type', 'dns_resolve_server'].some((k) => (opts as any)[k] !== undefined)) {
+      await assertResolvedTargetAllowed(effectiveTarget(merged));
+    }
     const res = await this.request('editMonitor', merged);
     if (!res?.ok) {
       throw new Error(`[${this.cfg.name}] edit monitor failed: ${safeFailureText(res)}`);

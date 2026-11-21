@@ -17,6 +17,8 @@
  * (DNS rebinding / attacker-controlled DNS) is not detected; denylist the resolved names you care about.
  */
 
+import { lookup } from 'node:dns/promises';
+
 export const SAFE_METHODS = ['GET', 'HEAD'] as const;
 export const WRITE_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'] as const;
 
@@ -265,3 +267,42 @@ export function assertTargetAllowed(t: { url?: unknown; hostname?: unknown; port
 
 /** Redirect cap while write methods are disabled: a followed redirect is a second, unchecked target (N1). */
 export const MAX_REDIRECTS_SAFE = 2;
+
+/** Resolver seam (tests inject a fake). Returns every A/AAAA address of `host`, or throws. */
+export type Resolver = (host: string) => Promise<string[]>;
+const systemResolver: Resolver = async (host) => (await lookup(host, { all: true, verbatim: true })).map((a) => a.address);
+const RESOLVE_TIMEOUT_MS = 3000;
+
+function isIpLiteral(h: string): boolean {
+  return ipv4ToInt(h) !== null || (h.includes(':') && ipv6ToBig(h) !== null);
+}
+
+/**
+ * Resolve-time check (closes the "public name -> internal address" gap at add/edit time): every address
+ * a monitor hostname resolves to, from THIS process's resolver, must also pass the denylist. A name that
+ * does not resolve here (e.g. a Docker-network name only Kuma can see) cannot be verified and is allowed.
+ * Limit: this is a point-in-time check; a record that changes after creation (DNS rebinding) is not seen.
+ * Network-level egress policy on the Kuma host is the control for that.
+ */
+export async function assertResolvedTargetAllowed(
+  t: { url?: unknown; hostname?: unknown; port?: unknown; dns_resolve_server?: unknown },
+  resolve: Resolver = systemResolver,
+): Promise<void> {
+  const port = t.port !== undefined && t.port !== null ? String(t.port) : '';
+  for (const raw of [t.url, t.hostname, t.dns_resolve_server]) {
+    if (typeof raw !== 'string' || raw === '') continue;
+    const p = parseTarget(raw);
+    if (!p || !p.host || isIpLiteral(p.host)) continue; // unparseable/literal: the literal check already ran
+    let addrs: string[];
+    try {
+      addrs = await Promise.race([
+        resolve(p.host),
+        new Promise<string[]>((_, rej) => setTimeout(() => rej(new Error('timeout')), RESOLVE_TIMEOUT_MS).unref()),
+      ]);
+    } catch { continue; } // does not resolve here: cannot verify
+    for (const a of addrs) {
+      try { assertTargetAllowed({ hostname: a, port: p.port || port }); }
+      catch { throw new Error('monitor target not allowed: hostname resolves to a denylisted address (loopback, link-local, gateway/MCP or KUMA_MCP_DENY_HOSTS)'); }
+    }
+  }
+}
