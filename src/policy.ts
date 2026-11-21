@@ -70,7 +70,31 @@ function isAllowedHost(host: string, port: string): boolean {
 }
 
 /** Entry grammar: host/glob[:port], IPv4 or IPv6 CIDR, bare IPv6, or [IPv6][:port]. */
+/** Single-label public suffixes a `*.` wildcard must not cover (every site under them). Homelab suffixes (.lan, .local, .home.arpa, .internal) stay allowed. */
+const PUBLIC_TLDS = new Set(['com', 'net', 'org', 'edu', 'gov', 'mil', 'int', 'info', 'biz', 'name', 'pro', 'io', 'dev', 'app', 'xyz', 'online', 'site', 'tech', 'cloud', 'me', 'tv', 'cc', 'co']);
+const CCSLD = /^(?:co|com|org|net|gov|edu|ac|or|ne|go|gob|mil|nom|ltd|plc|sch|gv|id|ind|nic)\.[a-z]{2}$/;
+
+/** Why a `*.suffix` host glob is too broad ("public suffix" / "numeric"), or null. Applies to any entry that starts with `*.`; a trailing `:port` is ignored. */
+export function wildcardProblem(entry: string): string | null {
+  const m = /^\*\.([a-z0-9_.-]+)(?::\d{1,5})?$/.exec(entry.toLowerCase());
+  if (!m) return null;
+  const suffix = m[1];
+  if (/^[0-9.]+$/.test(suffix)) return 'numeric wildcard (matches IP-address-shaped names, not a domain)';
+  if (PUBLIC_TLDS.has(suffix) || CCSLD.test(suffix) || /^[a-z]{2}$/.test(suffix)) return `public suffix wildcard (covers every host under .${suffix})`;
+  return null;
+}
+
+/** Entries in the three operator host lists that are too-broad wildcards: the server refuses to start with any (see index.ts). */
+export function wildcardProblems(): { env: string; entry: string; reason: string }[] {
+  const out: { env: string; entry: string; reason: string }[] = [];
+  for (const env of ['KUMA_MCP_ALLOW_HOSTS', 'KUMA_MCP_DENY_HOSTS', 'KUMA_MCP_NOTIFICATION_HOSTS']) {
+    for (const entry of envEntries(env)) { const reason = wildcardProblem(entry); if (reason) out.push({ env, entry, reason }); }
+  }
+  return out;
+}
+
 function validEntry(e: string): boolean {
+  if (wildcardProblem(e)) return false;
   const c4 = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(e);
   if (c4) return ipv4ToInt(c4[1]) !== null && Number(c4[2]) <= 32;
   const c6 = /^([0-9a-f:.]*:[0-9a-f:.]*)\/(\d{1,3})$/i.exec(e);
@@ -388,6 +412,7 @@ export async function assertResolvedTargetAllowed(
 function parseNotificationHostEntry(e: string): { host: string; port?: string; glob: boolean } | null {
   const m = /^(?:\[([0-9a-f:.]+)\]|(\*\.)?([a-z0-9_-]+(?:\.[a-z0-9_-]+)*))(?::(\d{1,5}))?$/i.exec(e);
   if (!m) return null;
+  if (wildcardProblem(e)) return null;
   if (m[4] !== undefined && !validPort(m[4])) return null;
   const host = (m[1] ?? m[3]).toLowerCase();
   if (m[1] !== undefined && ipv6ToBig(host) === null) return null;
@@ -558,13 +583,14 @@ export async function assertNotificationConfigAllowed(config: Record<string, unk
       throw new Error('notification config not allowed: the ntfy topic is not listed in KUMA_MCP_NTFY_TOPICS on the MCP server');
     }
   }
-  if (type === 'ntfy' && typeof config.ntfyserverurl === 'string') {
+  if (type === 'ntfy') {
     // Kuma POSTs {topic: ntfytopic, ...} to ntfyserverurl; ntfy only honours that JSON topic at the server ROOT, and a POST
     // to /<topic> publishes to that topic instead. A path, query or fragment would bypass KUMA_MCP_NTFY_TOPICS.
-    const v = config.ntfyserverurl.replace(/[\t\r\n]/g, '').trim();
-    let rootOnly = false;
-    try { const u = new URL(v); rootOnly = (u.pathname === '' || u.pathname === '/') && !v.includes('?') && !v.includes('#'); } catch { rootOnly = v === ''; }
-    if (!rootOnly) throw new Error('notification config not allowed: ntfyserverurl must be the server root (no path, query or fragment)');
+    // An empty/missing value makes Kuma fall back to a default it picks itself (a blind request), so it is refused too.
+    // The check is on the RAW text: URL parsing would normalise `/.`, `/..` and `\x` into something that looks like a root.
+    const v = typeof config.ntfyserverurl === 'string' ? config.ntfyserverurl.replace(/[\t\r\n]/g, '').trim() : '';
+    if (v === '') throw new Error('notification config not allowed: ntfy needs ntfyserverurl set to the server root (an empty value makes Kuma pick a default)');
+    if (!/^[a-z][a-z0-9+.-]*:\/\/[^/\\?#]+\/?$/i.test(v)) throw new Error('notification config not allowed: ntfyserverurl must be the server root (no path, query or fragment)');
   }
   const known = new Set<string>([...(spec.keys ?? []), ...(spec.multi ?? []), ...(spec.pair ?? []), ...(spec.skip ?? [])]);
   const notString = (k: string) => new Error(`notification config not allowed: "${k}" must be a plain string`);

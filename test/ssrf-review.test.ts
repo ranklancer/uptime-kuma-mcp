@@ -384,7 +384,8 @@ test('R4-H1 KUMA_MCP_NOTIFICATION_HOSTS: default empty refuses every destination
     await assert.rejects(assertNotificationConfigAllowed({ type: 'smtp', smtpHost: 'mail.example.com', smtpPort: 587 }, res({ 'mail.example.com': ['203.0.113.9'] })), /KUMA_MCP_NOTIFICATION_HOSTS/);
     await assert.rejects(assertNotificationConfigAllowed({ type: 'apprise', appriseURL: 'json://203.0.113.9/x' }), /KUMA_MCP_NOTIFICATION_HOSTS/);
     await assertNotificationConfigAllowed({ type: 'apprise', appriseURL: 'tgram://123456:ABCdef/987' }); // fixed external service: exempt
-    await assertNotificationConfigAllowed({ type: 'ntfy', ntfytopic: 't' }); // no destination field set: nothing to list
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfytopic: 't' }), /ntfyserverurl/); // R7-a: ntfy must name its server
+    await assertNotificationConfigAllowed({ type: 'gotify', gotifyserverurl: '' }); // no destination field set: nothing to list
   });
   await withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: 'ntfy.lan.example, 192.168.1.60:8080', KUMA_MCP_ALLOW_HOSTS: 'ntfy.lan.example' }, async () => {
     await assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://ntfy.lan.example/' }, res({}));
@@ -517,6 +518,42 @@ test('R6-M1 ntfyserverurl must be the server root: a path, query or fragment wou
 
 test('R6-L1 a *. glob in NOTIFICATION_HOSTS needs at least two labels after the star', async () => {
   await withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: '*.com,*.example,*.lan.example,*.co.uk' }, () => {
-    assert.deepEqual(invalidNotificationHostEntries(), ['*.com', '*.example']);
+    assert.deepEqual(invalidNotificationHostEntries(), ['*.com', '*.example', '*.co.uk']);
   });
+});
+
+// ── review round 7 (Low items) ──────────────────────────────────────────────
+test('R7-a ntfy needs a non-empty ntfyserverurl (Kuma would otherwise make a blind request to a default)', async () => {
+  for (const cfg of [{ type: 'ntfy', ntfytopic: 't' }, { type: 'ntfy', ntfytopic: 't', ntfyserverurl: '' }, { type: 'ntfy', ntfytopic: 't', ntfyserverurl: '   ' }, { type: 'ntfy', ntfytopic: 't', ntfyserverurl: null }, { type: 'ntfy', ntfytopic: 't', ntfyserverurl: 5 }])
+    await assert.rejects(assertNotificationConfigAllowed(cfg as any), /ntfyserverurl/, JSON.stringify(cfg));
+  await assertNotificationConfigAllowed({ type: 'ntfy', ntfytopic: 't', ntfyserverurl: 'https://203.0.113.9' });
+});
+
+test('R7-b the server-root check rejects dot-segment and encoded paths that URL parsing would normalise away', async () => {
+  const ntfy = (ntfyserverurl: string) => assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl, ntfytopic: 't' });
+  for (const u of ['https://203.0.113.9/.', 'https://203.0.113.9/..', 'https://203.0.113.9/./', 'https://203.0.113.9/a/..', 'https://203.0.113.9/%2e', 'https://203.0.113.9/%2E%2E', 'https://203.0.113.9\\x', 'https://203.0.113.9\\', 'https://203.0.113.9/\\x'])
+    await assert.rejects(ntfy(u), /server root/, u);
+  await ntfy('https://203.0.113.9'); await ntfy('https://203.0.113.9/');
+});
+
+test('R7-c public-suffix and numeric wildcards are rejected in ALLOW/DENY/NOTIFICATION host env parsing', async () => {
+  const { invalidAllowEntries, invalidDenyEntries, wildcardProblems } = await import('../src/policy.js');
+  const bad = ['*.co.uk', '*.com.au', '*.com', '*.org.uk', '*.1.2.3', '*.10', '*.192.168.1:80'];
+  const good = ['*.lan.example', '*.example.com', '*.lan', '*.home.arpa', '*bifrost*', '*.localhost'];
+  await withEnv({ KUMA_MCP_ALLOW_HOSTS: [...bad, ...good].join(','), KUMA_MCP_DENY_HOSTS: [...bad, ...good].join(','), KUMA_MCP_NOTIFICATION_HOSTS: [...bad, ...good].join(',') }, async () => {
+    for (const fn of [invalidAllowEntries, invalidDenyEntries]) for (const b of bad) assert.ok(fn().includes(b), `${fn.name} should reject ${b}`);
+    for (const b of bad) assert.ok(invalidNotificationHostEntries().includes(b), `notification should reject ${b}`);
+    for (const g of good) assert.ok(!invalidAllowEntries().includes(g) && !invalidDenyEntries().includes(g), g);
+    const p = wildcardProblems();
+    for (const env of ['KUMA_MCP_ALLOW_HOSTS', 'KUMA_MCP_DENY_HOSTS', 'KUMA_MCP_NOTIFICATION_HOSTS']) for (const b of bad) assert.ok(p.some((x) => x.env === env && x.entry === b && x.reason.length > 0), `${env} ${b}`);
+    assert.ok(!p.some((x) => good.includes(x.entry)));
+  });
+  await withEnv({ KUMA_MCP_DENY_HOSTS: '*.co.uk' }, async () => { assert.throws(() => denyList(), /invalid entry/); }); // refused, never silently skipped
+});
+
+test('R7-c the server refuses to start with such an entry and says why', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const r = spawnSync(process.execPath, [new URL('../src/index.js', import.meta.url).pathname], { env: { ...process.env, KUMA_MCP_ALLOW_HOSTS: '*.co.uk', PORT: '0' }, encoding: 'utf8', timeout: 15000 });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /KUMA_MCP_ALLOW_HOSTS.*\*\.co\.uk.*public suffix/i);
 });
