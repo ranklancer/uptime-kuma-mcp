@@ -269,7 +269,8 @@ function parseTarget(raw: string): { host: string; port: string } | null {
     // Scheme-less targets only count a port that was written explicitly.
     let port = u.port;
     if (!port && sch) port = DEFAULT_PORTS[sch[1].toLowerCase()] ?? '';
-    if (!port && !sch) { const m = /:(\d+)(?:[/?#]|$)/.exec(s.replace(/^\[[^\]]*\]/, '')); if (m) port = m[1]; }
+    // The port of a scheme-less target is the one in its AUTHORITY: a `:5700` after a `/ ? #` is path text (Kuma would connect to port 80).
+    if (!port && !sch) { const m = /:(\d+)$/.exec(rawAuth.replace(/^\[[^\]]*\]/, '')); if (m) port = m[1]; }
     // WHATWG keeps characters such as `;` `%` `{` in a hostname that Node's legacy url.parse (used by older axios in Kuma)
     // cuts off at, so the name checked here could differ from the host Kuma connects to. Anything but a plain DNS name or an IP literal is refused.
     if (!/^[a-z0-9._-]+$/.test(host) && !(host.includes(':') && ipv6ToBig(host) !== null)) return null;
@@ -632,6 +633,8 @@ export async function assertNotificationConfigAllowed(config: Record<string, unk
     const v = config[k];
     if (v === undefined || v === null) continue;
     if (typeof v !== 'string') throw notString(k);
+    // The value is sent to Kuma as written; Kuma's `startsWith("http")` / URL parsing differ for a value with leading or trailing whitespace, so it is refused rather than trimmed.
+    if (v !== v.trim()) throw new Error('notification config not allowed: destination has leading or trailing whitespace');
     await checkNotificationDestination(v, resolve, { apprise: type === 'apprise', schemeOptional: k === 'httpAddr' });
   }
   for (const k of spec.multi ?? []) {

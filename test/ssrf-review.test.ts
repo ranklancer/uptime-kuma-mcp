@@ -696,3 +696,22 @@ test('R13 httpAddr with a non-lowercase-http scheme is refused (Kuma prefixes ht
     await assert.rejects(assertNotificationConfigAllowed({ type: 'nostr', relays: 'wss:443@x.example:443' }, res({})), /not allowed/);
   });
 });
+
+test('R13-B1 leading/trailing whitespace on a destination is refused (Kuma gets the raw value: " http://x" gets http:// prefixed -> localhost)', async () => {
+  await withEnv({ KUMA_MCP_NOTIFICATION_TYPES: 'onebot,webhook', KUMA_MCP_NOTIFICATION_HOSTS: 'x.example,x.example:5700,192.168.1.54:5700', KUMA_MCP_ALLOW_HOSTS: '*.example,192.168.1.54' }, async () => {
+    for (const v of [' http://x.example:5700', '  https://x.example', ' 192.168.1.54:5700', '192.168.1.54:5700 ', 'https://x.example\u00a0'])
+      await assert.rejects(assertNotificationConfigAllowed({ type: 'onebot', httpAddr: v }, res({})), /whitespace|not allowed/, JSON.stringify(v));
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', httpMethod: 'GET', webhookURL: ' https://x.example/h' }, res({})), /whitespace/);
+    await assertNotificationConfigAllowed({ type: 'onebot', httpAddr: '192.168.1.54:5700' }, res({}));
+  });
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfytopic: 't', ntfyserverurl: ' https://x.example' }), /whitespace|server root|not allowed/);
+});
+
+test('R13-B2 a :port written after / ? # in a scheme-less target is path text, not the port', async () => {
+  await withEnv({ KUMA_MCP_NOTIFICATION_TYPES: 'onebot', KUMA_MCP_NOTIFICATION_HOSTS: '192.168.1.54:5700,x.example:5700', KUMA_MCP_ALLOW_HOSTS: '*.example,192.168.1.54' }, async () => {
+    for (const v of ['192.168.1.54/:5700', '192.168.1.54?:5700', '192.168.1.54#:5700', 'x.example/:5700'])
+      await assert.rejects(assertNotificationConfigAllowed({ type: 'onebot', httpAddr: v }, res({})), /not allowed/, v);
+    await assertNotificationConfigAllowed({ type: 'onebot', httpAddr: 'x.example:5700/path' }, res({}));
+  });
+  await withEnv({ KUMA_MCP_DENY_HOSTS: '192.168.1.54:5700' }, async () => { assert.throws(() => assertTargetAllowed({ hostPort: '192.168.1.54:5700' }), /not allowed/); assertTargetAllowed({ hostPort: '192.168.1.54/:5700' }); });
+});
