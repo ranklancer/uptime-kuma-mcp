@@ -46,3 +46,14 @@ test('monitor cache follows updateMonitorIntoList / deleteMonitorFromList', () =
   assert.deepEqual(Object.keys(c.monitorCache), ['1']);
   assert.equal(c.heartbeatStatusCache.has(2), false);
 });
+
+test('resolve-time check: a name resolving to a denylisted address is refused; unresolvable names and literals pass', async () => {
+  const { assertResolvedTargetAllowed } = await import('../src/policy.js');
+  const res = (m: Record<string, string[] | 'fail'>) => async (h: string) => { const v = m[h]; if (!v || v === 'fail') throw new Error('ENOTFOUND'); return v; };
+  await assert.rejects(assertResolvedTargetAllowed({ url: 'https://evil.example/x' }, res({ 'evil.example': ['203.0.113.9', '127.0.0.1'] })), /resolves to a denylisted/);
+  await assert.rejects(assertResolvedTargetAllowed({ hostname: 'evil6.example' }, res({ 'evil6.example': ['::1'] })), /resolves to a denylisted/);
+  await assert.rejects(assertResolvedTargetAllowed({ hostname: 'meta.example' }, res({ 'meta.example': ['169.254.169.254'] })), /resolves to a denylisted/);
+  await assertResolvedTargetAllowed({ url: 'https://ok.example/' }, res({ 'ok.example': ['203.0.113.9'] }));
+  await assertResolvedTargetAllowed({ hostname: 'grafana' }, res({ grafana: 'fail' }));
+  await assertResolvedTargetAllowed({ hostname: '192.0.2.5' }, res({}));
+});
