@@ -5,7 +5,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { toolDefs } from './tools.js';
-import { invalidDenyEntries } from './policy.js';
+import { invalidDenyEntries, invalidAllowEntries } from './policy.js';
 import { disconnectAll } from './instances.js';
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
@@ -140,6 +140,10 @@ const httpServer = http.createServer(async (req, res) => {
   const bad = invalidDenyEntries();
   if (bad.length > 0) {
     console.error(`WARNING: KUMA_MCP_DENY_HOSTS has invalid entries (monitor add/edit will fail until fixed): ${bad.join(', ')}`);
+  }
+  const badAllow = invalidAllowEntries();
+  if (badAllow.length > 0) {
+    console.error(`WARNING: KUMA_MCP_ALLOW_HOSTS has invalid entries (ignored, so those hosts stay unverified and are refused): ${badAllow.join(', ')}`);
   }
 }
 

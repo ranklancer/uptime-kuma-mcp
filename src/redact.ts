@@ -262,8 +262,12 @@ export function sanitizeHeartbeatMsg(input: unknown): unknown {
   if (/JSON|Unexpected token|Unexpected end/i.test(msg) && /invalid|valid JSON|Unexpected|position/i.test(msg)) {
     return WITHHELD;
   }
+  // M1: a keyword monitor's failure text carries an excerpt of the response body after this marker
+  // ("... but the keyword is not in [<first 50 chars>...]"): a yes/no oracle on an internal page. Drop it.
+  const kw = /(keyword is (?:not )?in\b)[\s\S]*$/i.exec(msg);
+  const safe = kw ? msg.slice(0, kw.index) + kw[1] + ' [response excerpt withheld]' : msg;
   // Bounded scheme ({0,31}) keeps the scan linear; msg is capped first so row cost is bounded too.
-  return msg.replace(/[a-z][a-z0-9+.-]{0,31}:\/\/[^\s"'<>]+/gi, (m) => String(scrubUrl(m)));
+  return safe.replace(/[a-z][a-z0-9+.-]{0,31}:\/\/[^\s"'<>]+/gi, (m) => String(scrubUrl(m)));
 }
 
 export function redactHeartbeatAck(res: any): any {

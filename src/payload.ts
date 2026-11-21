@@ -1,5 +1,5 @@
 import { createHash, randomInt } from 'node:crypto';
-import { allowWriteMethods, assertMethodAndBodyAllowed, assertTargetAllowed, effectiveTarget, isPlaceholderUrl, MAX_REDIRECTS_SAFE, UI_DEFAULT_PORTS } from './policy.js';
+import { allowWriteMethods, assertMethodAndBodyAllowed, assertTargetAllowed, effectiveTarget, isPlaceholderUrl, maxRedirectsCap, UI_DEFAULT_PORTS } from './policy.js';
 
 /**
  * Monitor payload construction for Kuma's `add` / `editMonitor` socket events.
@@ -140,6 +140,23 @@ const TYPE_ONLY_FIELDS: Array<{ types: string[]; reset: Record<string, unknown> 
   { types: ['mqtt'], reset: { mqttUsername: '', mqttPassword: '', mqttTopic: '', mqttSuccessMessage: '', mqttWebsocketPath: '', mqttCheckType: 'keyword' } },
 ];
 
+/** Headers that steer virtual-host routing or method/URL rewriting behind a reverse proxy: refused (M2). */
+const FORBIDDEN_HEADERS = ['host', 'x-forwarded-host', 'x-original-url', 'x-rewrite-url', 'x-http-method-override'];
+
+function assertHeadersAllowed(headers: unknown): void {
+  let h: unknown = headers;
+  if (typeof h === 'string') {
+    if (h.trim() === '') return;
+    try { h = JSON.parse(h); } catch { return; } // Kuma rejects non-JSON headers itself
+  }
+  if (!h || typeof h !== 'object') return;
+  for (const k of Object.keys(h)) {
+    if (FORBIDDEN_HEADERS.includes(k.trim().toLowerCase())) {
+      throw new Error(`header "${k.trim()}" is not allowed (it can redirect the request to another virtual host or rewrite its method/URL)`);
+    }
+  }
+}
+
 /** Keys a caller can never set: the token is server-generated, active/ownership are not tool-controlled. */
 const FORBIDDEN_INPUT_KEYS = ['pushToken', 'active', 'user_id', 'id'];
 
@@ -173,6 +190,7 @@ function normalizeCommon(m: Record<string, any>): void {
 export function buildAddPayload(rawOpts: Record<string, any>): Record<string, any> {
   const opts = sanitizeInput(rawOpts);
   if ('port' in opts) opts.port = normalizePort(opts.port);
+  assertHeadersAllowed(opts.headers);
   assertMethodAndBodyAllowed(opts);
   assertTargetAllowed({
     ...opts,
@@ -180,10 +198,10 @@ export function buildAddPayload(rawOpts: Record<string, any>): Record<string, an
     port: opts.port ?? UI_DEFAULT_PORTS[String(opts.type ?? '')],
   });
   const m = monitorDefaults();
-  if (!allowWriteMethods()) m.maxredirects = 0; // default off; callers may raise it to the cap
   applyChanges(m, opts);
   if ((m.port === undefined || m.port === null) && UI_DEFAULT_PORTS[m.type]) m.port = UI_DEFAULT_PORTS[m.type]; // as the UI does
-  if (!allowWriteMethods()) m.maxredirects = Math.min(Number(m.maxredirects) || 0, MAX_REDIRECTS_SAFE);
+  // H2: a followed redirect is a second, unchecked target: forced to 0 (operator may allow a cap of 2), with or without write methods.
+  m.maxredirects = Math.min(opts.maxredirects === undefined ? 0 : Number(opts.maxredirects) || 0, maxRedirectsCap());
   if (opts.timeout === undefined || opts.timeout === null || opts.timeout === 0) {
     m.timeout = deriveTimeout(m.type, m.interval);
   }
@@ -212,6 +230,7 @@ export function buildEditPayloadWithNotes(
   const notes: string[] = [];
   const changes = sanitizeInput(rawChanges);
   if ('port' in changes) changes.port = normalizePort(changes.port);
+  assertHeadersAllowed(changes.headers);
   assertMethodAndBodyAllowed(changes);
   const m: Record<string, any> = { ...current };
   for (const k of READ_ONLY_KEYS) delete m[k];
@@ -245,12 +264,12 @@ export function buildEditPayloadWithNotes(
   // The denylist applies even when write methods are enabled: the monitor's EFFECTIVE target for its
   // type must be allowed (a ping->http type change must not activate a stale url aimed at metadata).
   if (shapingChange) assertTargetAllowed(effectiveTarget(m));
-  if (!allowWriteMethods() && shapingChange) {
-    assertMethodAndBodyAllowed(m);
+  if (shapingChange) {
+    if (!allowWriteMethods()) assertMethodAndBodyAllowed(m);
     const before = Number(m.maxredirects) || 0;
-    m.maxredirects = Math.min(before, MAX_REDIRECTS_SAFE);
+    m.maxredirects = Math.min(before, maxRedirectsCap());
     if (m.maxredirects !== before) {
-      notes.push(`maxredirects was reduced from ${before} to ${m.maxredirects} (policy cap while KUMA_MCP_ALLOW_WRITE_METHODS is off)`);
+      notes.push(`maxredirects was reduced from ${before} to ${m.maxredirects} (policy cap: a redirect is an unchecked second target; operator can allow up to 2 with KUMA_MCP_ALLOW_REDIRECTS=1)`);
     }
   }
   m.id = monitorId;

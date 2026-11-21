@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+process.env.KUMA_MCP_ALLOW_HOSTS = '*'; // these tests use fictional names the system resolver cannot see
 import { EventEmitter } from 'node:events';
 import { UptimeKumaClient, isNotLoggedIn } from '../src/uptime-kuma-client.js';
 import { buildAddPayload, buildEditPayload, genPushToken, fingerprint, deriveTimeout, normalizeStatusCodes } from '../src/payload.js';

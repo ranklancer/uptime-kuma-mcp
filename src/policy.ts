@@ -13,8 +13,15 @@
  *     exact host, `*` glob (`*.corp.example`), IPv4 CIDR (`10.0.0.0/8`), or `host:port`
  *     (`gateway.internal:8080`). Operators should list the real gateway host:port here.
  *
- * Limits: this checks the literal target. A public DNS name that resolves to an internal address
- * (DNS rebinding / attacker-controlled DNS) is not detected; denylist the resolved names you care about.
+ * Resolve-time check (assertResolvedTargetAllowed): every address a hostname resolves to, from this
+ * process's resolver, must also pass the denylist. FAIL CLOSED: a name that cannot be resolved (or times out)
+ * is refused unless it matches KUMA_MCP_ALLOW_HOSTS, so a name this process cannot see (a docker service
+ * name) must be listed there. Optional KUMA_MCP_DENY_PRIVATE=1 also denies RFC1918 and CGNAT 100.64/10
+ * (hosts matching KUMA_MCP_ALLOW_HOSTS are exempt from that range check only).
+ *
+ * Limits: the check is point-in-time. A record that changes after creation (DNS rebinding / attacker-controlled
+ * DNS) is not seen; only a network egress policy on the Kuma host closes that. Redirects are a second,
+ * unchecked target, so maxredirects is forced to 0 (KUMA_MCP_ALLOW_REDIRECTS=1 relaxes it to a cap of 2).
  */
 
 import { lookup } from 'node:dns/promises';
@@ -31,6 +38,35 @@ const BUILTIN_DENY = [
   'fe80::/10', 'fc00::/7', '::/96', '64:ff9b::/96', // link-local, ULA, IPv4-compatible (::127.0.0.1), NAT64
   'host.docker.internal', 'metadata.google.internal', '*bifrost*', '*mcp*',
 ];
+
+/** Opt-in (KUMA_MCP_DENY_PRIVATE=1): RFC1918 and CGNAT. Default off so existing deployments do not change until the operator opts in. */
+const PRIVATE_DENY = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '100.64.0.0/10'];
+
+export function denyPrivate(): boolean {
+  return process.env.KUMA_MCP_DENY_PRIVATE === '1';
+}
+
+/** Redirect cap for monitors: 0 unless the operator sets KUMA_MCP_ALLOW_REDIRECTS=1 (then 2). A redirect is an unchecked second target. */
+export function maxRedirectsCap(): number {
+  return process.env.KUMA_MCP_ALLOW_REDIRECTS === '1' ? MAX_REDIRECTS_SAFE : 0;
+}
+
+function envEntries(name: string): string[] {
+  return (process.env[name] ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+}
+
+/** Hosts the operator vouches for (KUMA_MCP_ALLOW_HOSTS): may fail to resolve here and are exempt from the private-range deny. Invalid entries are ignored (fail closed) and listed by invalidAllowEntries(). */
+export function allowHosts(): string[] {
+  return envEntries('KUMA_MCP_ALLOW_HOSTS').filter(validEntry);
+}
+
+export function invalidAllowEntries(): string[] {
+  return envEntries('KUMA_MCP_ALLOW_HOSTS').filter((e) => !validEntry(e));
+}
+
+function isAllowedHost(host: string, port: string): boolean {
+  return allowHosts().some((e) => entryMatches(e, host, port));
+}
 
 /** Entry grammar: host/glob[:port], IPv4 or IPv6 CIDR, bare IPv6, or [IPv6][:port]. */
 function validEntry(e: string): boolean {
@@ -79,19 +115,23 @@ function normalizeEntry(entry: string): string {
 
 /** Operator entries that will be refused (for a startup warning). Contains no secrets: entries are host patterns. */
 export function invalidDenyEntries(): string[] {
-  return (process.env.KUMA_MCP_DENY_HOSTS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean).filter((e) => !validEntry(e));
+  return envEntries('KUMA_MCP_DENY_HOSTS').filter((e) => !validEntry(e));
 }
 
 /**
  * Built-ins plus KUMA_MCP_DENY_HOSTS. A malformed operator entry is REFUSED (an error on every
  * add/edit) rather than skipped: a typo must not silently leave a target allowed.
  */
-export function denyList(): string[] {
-  const extra = (process.env.KUMA_MCP_DENY_HOSTS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+export function denyList(exemptPrivate = false): string[] {
+  const extra = envEntries('KUMA_MCP_DENY_HOSTS');
   for (const e of extra) {
-    if (!validEntry(e)) throw new Error(`KUMA_MCP_DENY_HOSTS has an invalid entry "${e}"; fix the MCP server environment (IPv6 with a port needs brackets: [2001:db8::5]:8080)`);
+    if (!validEntry(e)) {
+      // The entry text stays in the server log; the MCP client only gets a generic message.
+      console.error(`KUMA_MCP_DENY_HOSTS has an invalid entry "${e}" (IPv6 with a port needs brackets: [2001:db8::5]:8080)`);
+      throw new Error('monitor target not allowed: KUMA_MCP_DENY_HOSTS on the MCP server has an invalid entry; the operator must fix it (see the server log)');
+    }
   }
-  return [...BUILTIN_DENY, ...extra];
+  return [...BUILTIN_DENY, ...extra, ...(denyPrivate() && !exemptPrivate ? PRIVATE_DENY : [])];
 }
 
 /** `https://` is the Kuma UI's placeholder url for non-HTTP monitors; it is not a target. */
@@ -122,12 +162,14 @@ function dbTargetOf(cs: unknown): string | undefined {
 }
 
 /** The fields of a (merged) monitor that actually make the outgoing request for its type. Unknown types: check both. */
-export function effectiveTarget(m: Record<string, any>): { url?: unknown; hostname?: unknown; port?: unknown; dns_resolve_server?: unknown } {
+export type Target = { url?: unknown; hostname?: unknown; hostPort?: unknown; port?: unknown; dns_resolve_server?: unknown };
+
+export function effectiveTarget(m: Record<string, any>): Target {
   const t = String(m.type ?? '');
   if (NO_TARGET_TYPES.includes(t)) return {};
   // A type change can activate a stale grpcUrl / databaseConnectionString left from an earlier type.
-  if (t === 'grpc') return { hostname: typeof m.grpcUrl === 'string' && m.grpcUrl.trim() ? m.grpcUrl.trim() : undefined };
-  if (DB_TYPES.includes(t)) return { hostname: dbTargetOf(m.databaseConnectionString) };
+  if (t === 'grpc') return { hostPort: typeof m.grpcUrl === 'string' && m.grpcUrl.trim() ? m.grpcUrl.trim() : undefined };
+  if (DB_TYPES.includes(t)) return { hostPort: dbTargetOf(m.databaseConnectionString) };
   const unknown = !URL_TYPES.includes(t) && !HOST_TYPES.includes(t);
   return {
     url: (URL_TYPES.includes(t) || unknown) && !isPlaceholderUrl(m.url) ? m.url : undefined,
@@ -246,12 +288,23 @@ function portOk(want: string | null, port: string): boolean {
   return want === null || (port !== '' && Number(want) === Number(port));
 }
 
+/**
+ * A `hostname` / DNS-server field is a bare host name or IP (L1): no scheme, userinfo, port or path.
+ * Parsing it as a URL would let `127.0.0.1@evil.com` be checked as evil.com while the checker connects to 127.0.0.1,
+ * and let a port embedded in the name override the port field.
+ */
+function assertBareHost(raw: string): void {
+  const s = raw.trim();
+  const ok = /^[a-z0-9_.-]+$/i.test(s) || (s.includes(':') && /^\[?[0-9a-f:.]+\]?$/i.test(s) && ipv6ToBig(s.replace(/^\[|\]$/g, '')) !== null);
+  if (!ok) throw new Error('monitor target not allowed: hostname must be a bare host name or IP address (no scheme, credentials, port or path)');
+}
+
 /** Throw if url/hostname (optionally with port) hits the denylist or cannot be parsed (fail closed). */
-export function assertTargetAllowed(t: { url?: unknown; hostname?: unknown; port?: unknown; dns_resolve_server?: unknown }): void {
-  const deny = denyList();
+export function assertTargetAllowed(t: Target, opts: { exemptPrivate?: boolean } = {}): void {
   const port = t.port !== undefined && t.port !== null ? String(t.port) : '';
-  for (const [field, raw] of [['url', t.url], ['hostname', t.hostname], ['dns', t.dns_resolve_server]] as const) {
+  for (const [field, raw] of [['url', t.url], ['hostname', t.hostname], ['hostPort', t.hostPort], ['dns', t.dns_resolve_server]] as const) {
     if (typeof raw !== 'string' || raw === '') continue;
+    if (field === 'hostname' || field === 'dns') assertBareHost(raw);
     // A monitor `url` must carry an explicit http/https/ws/wss scheme (no scheme-less or relative forms).
     if (field === 'url' && !/^(https?|wss?):\/\//i.test(raw.trim())) {
       throw new Error('monitor target not allowed: url must start with http://, https://, ws:// or wss://');
@@ -259,6 +312,8 @@ export function assertTargetAllowed(t: { url?: unknown; hostname?: unknown; port
     const p = parseTarget(raw);
     if (!p) throw new Error('monitor target not allowed: unparseable url/hostname or scheme not in http/https/ws/wss');
     const eff = p.port || port;
+    // An operator-vouched host is exempt from the opt-in private-range deny only; every other entry still applies.
+    const deny = denyList(opts.exemptPrivate === true || isAllowedHost(p.host, eff));
     if (deny.some((e) => entryMatches(e, p.host, eff))) {
       throw new Error('monitor target not allowed: host is on the denylist (loopback, link-local, gateway/MCP or KUMA_MCP_DENY_HOSTS)');
     }
@@ -280,29 +335,82 @@ function isIpLiteral(h: string): boolean {
 /**
  * Resolve-time check (closes the "public name -> internal address" gap at add/edit time): every address
  * a monitor hostname resolves to, from THIS process's resolver, must also pass the denylist. A name that
- * does not resolve here (e.g. a Docker-network name only Kuma can see) cannot be verified and is allowed.
+ * does not resolve here (e.g. a Docker-network name only Kuma can see) cannot be verified and is REFUSED unless
+ * it matches KUMA_MCP_ALLOW_HOSTS (fail closed).
  * Limit: this is a point-in-time check; a record that changes after creation (DNS rebinding) is not seen.
  * Network-level egress policy on the Kuma host is the control for that.
  */
 export async function assertResolvedTargetAllowed(
-  t: { url?: unknown; hostname?: unknown; port?: unknown; dns_resolve_server?: unknown },
+  t: Target,
   resolve: Resolver = systemResolver,
 ): Promise<void> {
   const port = t.port !== undefined && t.port !== null ? String(t.port) : '';
-  for (const raw of [t.url, t.hostname, t.dns_resolve_server]) {
+  for (const raw of [t.url, t.hostname, t.hostPort, t.dns_resolve_server]) {
     if (typeof raw !== 'string' || raw === '') continue;
     const p = parseTarget(raw);
     if (!p || !p.host || isIpLiteral(p.host)) continue; // unparseable/literal: the literal check already ran
+    const allowed = isAllowedHost(p.host, p.port || port);
     let addrs: string[];
     try {
       addrs = await Promise.race([
         resolve(p.host),
         new Promise<string[]>((_, rej) => setTimeout(() => rej(new Error('timeout')), RESOLVE_TIMEOUT_MS).unref()),
       ]);
-    } catch { continue; } // does not resolve here: cannot verify
+    } catch {
+      // H4: fail closed. A name that does not resolve (or times out) here cannot be verified.
+      if (allowed) continue;
+      throw new Error('monitor target not allowed: hostname could not be resolved to verify it (the operator can list legitimate internal names in KUMA_MCP_ALLOW_HOSTS)');
+    }
     for (const a of addrs) {
-      try { assertTargetAllowed({ hostname: a, port: p.port || port }); }
+      try { assertTargetAllowed({ hostname: a, port: p.port || port }, { exemptPrivate: allowed }); }
       catch { throw new Error('monitor target not allowed: hostname resolves to a denylisted address (loopback, link-local, gateway/MCP or KUMA_MCP_DENY_HOSTS)'); }
     }
+  }
+}
+
+/** Notification config keys whose values name a network destination (H1). */
+const NOTIF_TARGET_KEY = /url|uri|endpoint|host|server/i;
+/** Webhook free-form request shaping: refused unless the operator allows write-style requests. */
+const NOTIF_REQUEST_SHAPING_KEYS = ['webhookCustomBody', 'webhookAdditionalHeaders'];
+
+function notificationTargets(v: unknown, key: string, out: string[], depth = 0): void {
+  if (depth > 6 || v === null || v === undefined) return;
+  if (typeof v === 'string') { if (NOTIF_TARGET_KEY.test(key) && v.trim() !== '') out.push(v.trim()); return; }
+  if (Array.isArray(v)) { for (const x of v) notificationTargets(x, key, out, depth + 1); return; }
+  if (typeof v === 'object') for (const [k, x] of Object.entries(v as Record<string, unknown>)) notificationTargets(x, NOTIF_TARGET_KEY.test(key) ? key : k, out, depth + 1);
+}
+
+/**
+ * Policy for notification provider config supplied by the caller (create/update): every URL/host-shaped value
+ * must pass the target denylist and the resolve-time check, and a webhook may not carry a custom body or
+ * additional headers (agent-controlled content POSTed on every status change = exfiltration channel)
+ * unless the operator set KUMA_MCP_ALLOW_WRITE_METHODS=1. Non-http(s) URL schemes (apprise: json://, tgram://)
+ * get the literal denylist check only: their "host" is often a token, so it cannot be resolved.
+ */
+export async function assertNotificationConfigAllowed(config: Record<string, unknown>, resolve?: Resolver): Promise<void> {
+  if (!allowWriteMethods()) {
+    for (const k of NOTIF_REQUEST_SHAPING_KEYS) {
+      const v = config[k];
+      if (v !== undefined && v !== null && v !== '') {
+        throw new Error('notification config not allowed: a custom webhook body or additional headers needs KUMA_MCP_ALLOW_WRITE_METHODS=1 on the MCP server');
+      }
+    }
+  }
+  const targets: string[] = [];
+  for (const [k, v] of Object.entries(config)) notificationTargets(v, k, targets);
+  for (const raw of targets) {
+    const sch = /^([a-z][a-z0-9+.-]*):\/\//i.exec(raw);
+    if (sch && !ALLOWED_SCHEMES.includes(sch[1].toLowerCase())) {
+      let u: URL;
+      try { u = new URL(raw); } catch { throw new Error('notification config not allowed: unparseable URL'); }
+      const host = u.hostname.replace(/^\[|\]$/g, '');
+      if (host) assertTargetAllowed({ hostPort: host + (u.port ? ':' + u.port : '') });
+      continue;
+    }
+    if (/\s/.test(raw)) continue; // free text, not a destination
+    if (sch) { assertTargetAllowed({ url: raw }); await assertResolvedTargetAllowed({ url: raw }, resolve); continue; }
+    const hp = raw.includes('/') || raw.includes('@') ? { url: 'http://' + raw } : { hostPort: raw };
+    assertTargetAllowed(hp);
+    await assertResolvedTargetAllowed(hp, resolve);
   }
 }

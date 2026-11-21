@@ -1,7 +1,7 @@
 import { io, Socket } from 'socket.io-client';
 import type { KumaInstanceConfig, KumaSession, MonitorOpts } from './types.js';
 import { buildAddPayload, buildEditPayloadWithNotes, fingerprint } from './payload.js';
-import { assertResolvedTargetAllowed, effectiveTarget } from './policy.js';
+import { assertResolvedTargetAllowed, assertNotificationConfigAllowed, effectiveTarget } from './policy.js';
 import {
   redactMonitorAck, redactHeartbeatAck, redactNotification, safeFailureText,
   assertMonitorEditAllowed, assertNotificationEditAllowed,
@@ -567,6 +567,8 @@ export class UptimeKumaClient {
     notificationID: number | null = null,
   ): Promise<any> {
     await this.ensureConnected();
+    // Create: the whole object is caller input. (Update checks only the incoming changes: see updateNotification.)
+    if (notificationID === null) await assertNotificationConfigAllowed(notification);
     const res = await this.request('addNotification', notification, notificationID ?? null);
     if (!res?.ok) {
       throw new Error(`[${this.cfg.name}] save notification failed: ${safeFailureText(res)}`);
@@ -600,6 +602,7 @@ export class UptimeKumaClient {
       ...(args.config ?? {}),
     };
     assertNotificationEditAllowed(currentConfig, changes);
+    await assertNotificationConfigAllowed(changes);
     const merged: Record<string, any> = { ...currentConfig, ...changes };
     // Kuma requires name and type to be present on save.
     if (merged.name === undefined) merged.name = (existing as any).name;

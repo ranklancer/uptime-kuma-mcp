@@ -87,6 +87,39 @@ async function attachTags(client: ReturnType<typeof getClient>, monitorId: numbe
   return results;
 }
 
+const CONFIRM_APPLY_DESC = 'Required (true) when isDefault or applyExisting is true: the provider then fires for every new / every existing monitor';
+
+/** isDefault / applyExisting make a provider fire for many monitors at once: same explicit-confirm style as the delete calls. */
+export function assertNotificationApplyConfirmed(a: { isDefault?: boolean; applyExisting?: boolean; confirmApply?: boolean }): void {
+  if ((a.isDefault === true || a.applyExisting === true) && a.confirmApply !== true) {
+    throw new Error('isDefault/applyExisting attach this notification provider to many monitors: pass confirmApply=true to proceed');
+  }
+}
+
+/** A maintenance window silences alerts: confirm when it covers more than 5 monitors, runs all day, or has no end (any strategy). */
+export function maintenanceNeedsConfirm(a: {
+  strategy: string; monitorIds: readonly number[]; dateRange?: readonly (string | null)[]; timeRange?: readonly { hours: number; minutes: number }[]; durationMinutes?: number;
+}): boolean {
+  if (a.monitorIds.length > 5) return true;
+  const DAY_MS = 24 * 3600 * 1000;
+  switch (a.strategy) {
+    case 'manual': return !a.dateRange?.[1];
+    case 'single': {
+      const [s, e] = a.dateRange ?? [];
+      if (!e) return true;
+      const span = s ? Date.parse(e.replace(' ', 'T')) - Date.parse(s.replace(' ', 'T')) : Infinity;
+      return !(span < DAY_MS); // NaN (unparseable) also needs confirm
+    }
+    case 'cron': return (a.durationMinutes ?? 60) >= 1440;
+    default: {
+      if (!a.timeRange) return false;
+      const [s, e] = a.timeRange;
+      const span = (((e.hours * 60 + e.minutes) - (s.hours * 60 + s.minutes)) + 1440) % 1440;
+      return span === 0 || span >= 1439;
+    }
+  }
+}
+
 export interface ToolDef {
   name: string;
   description: string;
@@ -328,8 +361,10 @@ export const toolDefs: ToolDef[] = [
       config:        z.record(z.string(), z.any()).optional().describe('Type-specific settings merged into the provider config (e.g. { ntfyserverurl, ntfytopic, ntfyPriority })'),
       isDefault:     z.boolean().optional().default(false).describe('Apply automatically to newly created monitors'),
       applyExisting: z.boolean().optional().default(false).describe('Immediately attach to all existing monitors on save'),
+      confirmApply:  z.boolean().optional().describe(CONFIRM_APPLY_DESC),
     }),
     handler: async (args) => {
+      assertNotificationApplyConfirmed(args);
       const notification = {
         name: args.name,
         type: args.type,
@@ -353,8 +388,10 @@ export const toolDefs: ToolDef[] = [
       config:         z.record(z.string(), z.any()).optional().describe('Type-specific settings to merge into the existing config'),
       isDefault:      z.boolean().optional().describe('Apply automatically to newly created monitors'),
       applyExisting:  z.boolean().optional().describe('Immediately attach to all existing monitors on save'),
+      confirmApply:   z.boolean().optional().describe(CONFIRM_APPLY_DESC),
     }),
     handler: async (args) => {
+      assertNotificationApplyConfirmed(args);
       return getClient(args.instance).updateNotification(args.notificationId, args);
     },
   },
@@ -399,13 +436,18 @@ export const toolDefs: ToolDef[] = [
       notificationId: z.number().int().positive().describe('The notification provider ID to apply'),
       enabled:        z.boolean().optional().default(true).describe('true = attach to all monitors, false = detach from all'),
       includeGroups:  z.boolean().optional().default(false).describe('Also apply to group monitors (default skips groups)'),
-      dryRun:         z.boolean().optional().default(false).describe('Preview the changes without applying them'),
+      dryRun:         z.boolean().optional().default(true).describe('Preview the changes without applying them (default true: pass false to apply)'),
+      confirmDetach:  z.boolean().optional().describe('Required (true) to apply enabled=false (detach from all monitors, silencing that provider everywhere)'),
     }),
-    handler: async (args) =>
-      getClient(args.instance).applyNotificationToAllMonitors(args.notificationId, args.enabled, {
+    handler: async (args) => {
+      if (!args.dryRun && args.enabled === false && args.confirmDetach !== true) {
+        throw new Error('detaching a notification provider from all monitors needs confirmDetach=true (preview first with dryRun=true)');
+      }
+      return getClient(args.instance).applyNotificationToAllMonitors(args.notificationId, args.enabled, {
         dryRun: args.dryRun,
         includeGroups: args.includeGroups,
-      }),
+      });
+    },
   },
 
   // ── Tags ─────────────────────────────────────────────────────────
@@ -466,17 +508,14 @@ export const toolDefs: ToolDef[] = [
       cron:           z.string().optional().describe('Cron expression (cron strategy)'),
       durationMinutes: z.number().int().positive().optional().default(60).describe('Window length in minutes (cron strategy)'),
       timezoneOption: z.string().optional().default('UTC').describe('IANA timezone, or "SAME_AS_SERVER"'),
-      confirmOpenEnded: z.boolean().optional().describe('Required for a "manual" window (active, suppressing alerts, until someone pauses it) when it covers more than 5 monitors or has no end time in dateRange'),
+      confirmOpenEnded: z.boolean().optional().describe('Required (true) for ANY strategy when the window covers more than 5 monitors, runs all day (24h or more), or is open-ended (e.g. a "manual" window with no end in dateRange)'),
     }),
     handler: async (args) => {
       const { instance, monitorIds, confirmOpenEnded, ...rest } = args;
-      if (rest.strategy === 'manual') {
-        const hasEnd = !!rest.dateRange?.[1];
-        if ((monitorIds.length > 5 || !hasEnd) && confirmOpenEnded !== true) {
-          throw new Error(
-            'a manual maintenance window silences alerts until someone pauses it: pass confirmOpenEnded=true ' +
-            '(required when it covers more than 5 monitors or has no end time)');
-        }
+      if (maintenanceNeedsConfirm({ ...rest, monitorIds }) && confirmOpenEnded !== true) {
+        throw new Error(
+          'this maintenance window silences alerts for a long or broad scope: pass confirmOpenEnded=true ' +
+          '(required for any strategy when it covers more than 5 monitors, runs all day, or has no end time)');
       }
       const maintenance = {
         ...rest,
