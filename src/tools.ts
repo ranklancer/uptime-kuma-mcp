@@ -32,7 +32,7 @@ const METHODS = (allowWriteMethods() ? [...SAFE_METHODS, ...WRITE_METHODS] : [..
 const monitorFields = {
   url:                z.string().optional().describe('URL to monitor (http/keyword types). Loopback, link-local, gateway/MCP hosts and KUMA_MCP_DENY_HOSTS entries are refused.'),
   hostname:           z.string().optional().describe('Hostname for ping/port/dns types'),
-  port:               z.number().int().optional().describe('Port number'),
+  port:               z.number().int().min(1).max(65535).optional().describe('Port number (1-65535)'),
   method:             z.enum(METHODS).optional().describe(
     allowWriteMethods() ? 'HTTP method' : 'HTTP method: GET or HEAD only (the operator can enable others with KUMA_MCP_ALLOW_WRITE_METHODS=1)'),
   interval:           z.number().int().positive().optional().describe('Check interval in seconds (default 60)'),

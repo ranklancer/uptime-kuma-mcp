@@ -104,11 +104,28 @@ export const UI_DEFAULT_PORTS: Record<string, number> = { dns: 53, radius: 1812,
 export const URL_TYPES = ['http', 'keyword', 'json-query', 'real-browser'];
 export const HOST_TYPES = ['port', 'ping', 'dns', 'tailscale-ping', 'smtp', 'snmp', 'steam', 'gamedig', 'mqtt', 'radius'];
 const NO_TARGET_TYPES = ['group', 'push', 'docker', 'manual'];
+const DB_TYPES = ['sqlserver', 'postgres', 'mysql', 'mongodb', 'redis'];
+
+/** Host[:port] of a stored DB connection string, or throws (fail closed) when it cannot be read. */
+function dbTargetOf(cs: unknown): string | undefined {
+  if (typeof cs !== 'string' || cs.trim() === '') return undefined;
+  const s = cs.trim();
+  try {
+    const u = new URL(s);
+    if (u.hostname) return u.hostname + (u.port ? ':' + u.port : '');
+  } catch { /* not URL-shaped: try key=value forms */ }
+  const kv = /(?:server|data source|host|address|addr)\s*=\s*(?:tcp:)?([^,;:\s]+)(?:[,:](\d+))?/i.exec(s);
+  if (kv) return kv[1] + (kv[2] ? ':' + kv[2] : '');
+  throw new Error('monitor target not allowed: stored database connection string has an unreadable host');
+}
 
 /** The fields of a (merged) monitor that actually make the outgoing request for its type. Unknown types: check both. */
 export function effectiveTarget(m: Record<string, any>): { url?: unknown; hostname?: unknown; port?: unknown; dns_resolve_server?: unknown } {
   const t = String(m.type ?? '');
   if (NO_TARGET_TYPES.includes(t)) return {};
+  // A type change can activate a stale grpcUrl / databaseConnectionString left from an earlier type.
+  if (t === 'grpc') return { hostname: typeof m.grpcUrl === 'string' && m.grpcUrl.trim() ? m.grpcUrl.trim() : undefined };
+  if (DB_TYPES.includes(t)) return { hostname: dbTargetOf(m.databaseConnectionString) };
   const unknown = !URL_TYPES.includes(t) && !HOST_TYPES.includes(t);
   return {
     url: (URL_TYPES.includes(t) || unknown) && !isPlaceholderUrl(m.url) ? m.url : undefined,
@@ -192,7 +209,9 @@ function entryMatches(rawEntry: string, host: string, port: string): boolean {
   const entry = normalizeEntry(rawEntry);
   const cidr6 = /^([0-9a-f:]*:[0-9a-f:.]*)\/(\d{1,3})$/i.exec(entry);
   if (cidr6) {
-    const ip = ipv6ToBig(host), base = ipv6ToBig(cidr6[1]), bits = Number(cidr6[2]);
+    // An IPv4 host is also the IPv4-mapped IPv6 address ::ffff:a.b.c.d, so a short prefix such as ::ffff:0:0/80 covers it.
+    const v4n = ipv4ToInt(host);
+    const ip = ipv6ToBig(host) ?? (v4n !== null ? (0xffffn << 32n) | BigInt(v4n) : null), base = ipv6ToBig(cidr6[1]), bits = Number(cidr6[2]);
     if (ip === null || base === null || bits > 128) return false;
     const shift = BigInt(128 - bits);
     return (ip >> shift) === (base >> shift);
