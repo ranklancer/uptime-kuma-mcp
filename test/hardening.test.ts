@@ -22,6 +22,7 @@ test('edit: port 0 clears to unset/default; out-of-range refused; stored port 0 
   assert.equal(buildEditPayload(cur(), { port: 0 }, 1).port, null);
   assert.equal(buildEditPayload(cur({ type: 'dns', port: 53 }), { port: 0 }, 1).port, 53);
   assert.equal(buildEditPayload(cur({ port: 0 }), { name: 'renamed' }, 1).port, null);
+  assert.equal(buildEditPayload(cur({ port: '0' }), { name: 'renamed' }, 1).port, null);
   for (const port of [-1, 65536, 1.5]) assert.throws(() => buildEditPayload(cur(), { port }, 1), /port must be an integer between 1 and 65535/);
 });
 

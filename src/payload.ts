@@ -116,14 +116,14 @@ export function normalizeStatusCodes(v: unknown): string[] | undefined {
 }
 
 /**
- * Explicit ports must be integers in 1-65535. 0 (and null/undefined) means "unset": the caller
- * gets the type's UI default, else null. Port 0 is never a valid check target.
+ * Explicit ports must be integers in 1-65535 (the tool schema refuses 0 first; this guards other
+ * callers). A 0/null that does reach the builders means "unset": the type's UI default, else null.
  */
 function normalizePort(v: unknown): number | null | undefined {
   if (v === undefined) return undefined;
   if (v === null || v === 0) return null;
   if (typeof v !== 'number' || !Number.isInteger(v) || v < 1 || v > 65535) {
-    throw new Error('port must be an integer between 1 and 65535 (0 or omitted = default)');
+    throw new Error('port must be an integer between 1 and 65535 (omit to leave it unchanged)');
   }
   return v;
 }
@@ -215,7 +215,7 @@ export function buildEditPayloadWithNotes(
   assertMethodAndBodyAllowed(changes);
   const m: Record<string, any> = { ...current };
   for (const k of READ_ONLY_KEYS) delete m[k];
-  if (m.port === 0) m.port = null; // a stored 0 means unset; never forward it
+  if (m.port !== null && m.port !== undefined && m.port !== '' && Number(m.port) === 0) m.port = null; // a stored 0 means unset; never forward it
   // Fill NOT NULL columns the server did not return (older/newer Kuma schema differences).
   const defaults = monitorDefaults();
   for (const k of ['conditions', 'kafkaProducerBrokers', 'kafkaProducerSaslOptions', 'rabbitmqNodes']) {
