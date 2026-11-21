@@ -115,20 +115,20 @@ test('H1 the client policy runs on create and on the incoming changes of an upda
 });
 
 // H2 ── redirects
-test('H2 maxredirects is forced to 0 even with write methods on', () => {
-  withEnv({ KUMA_MCP_ALLOW_WRITE_METHODS: '1' }, () => {
+test('H2 maxredirects is forced to 0 even with write methods on', async () => {
+  await withEnv({ KUMA_MCP_ALLOW_WRITE_METHODS: '1' }, () => {
     assert.equal(buildAddPayload({ name: 'x', url: 'https://203.0.113.9/', maxredirects: 10 }).maxredirects, 0);
     assert.equal(buildEditPayload({ id: 1, type: 'http', url: 'https://203.0.113.9/', maxredirects: 10, timeout: 48, interval: 60 }, { maxredirects: 5 }, 1).maxredirects, 0);
   });
 });
 
 // H3 ── opt-in private ranges
-test('H3 KUMA_MCP_DENY_PRIVATE=1 denies RFC1918/CGNAT unless the host is allow-listed; default is unchanged', () => {
+test('H3 KUMA_MCP_DENY_PRIVATE=1 denies RFC1918/CGNAT unless the host is allow-listed; default is unchanged', async () => {
   for (const h of ['10.1.2.3', '172.16.5.5', '172.31.255.1', '192.168.1.54', '100.64.0.1', '100.127.255.254']) {
     assert.doesNotThrow(() => assertTargetAllowed({ hostname: h }), `${h} default allowed`);
   }
   assert.ok(!denyList().includes('10.0.0.0/8'));
-  withEnv({ KUMA_MCP_DENY_PRIVATE: '1', KUMA_MCP_ALLOW_HOSTS: 'nas.lan,192.168.1.60' }, () => {
+  await withEnv({ KUMA_MCP_DENY_PRIVATE: '1', KUMA_MCP_ALLOW_HOSTS: 'nas.lan,192.168.1.60' }, () => {
     for (const h of ['10.1.2.3', '172.16.5.5', '172.31.255.1', '192.168.1.54', '100.64.0.1', '100.127.255.254']) {
       assert.throws(() => assertTargetAllowed({ hostname: h }), /denylist/, h);
     }
@@ -223,8 +223,8 @@ test('M3 apply_notification_to_all_monitors: dryRun defaults to true; detaching 
 });
 
 // denyList message
-test('a malformed KUMA_MCP_DENY_HOSTS entry is not echoed to the MCP client', () => {
-  withEnv({ KUMA_MCP_DENY_HOSTS: 'sup3r-secret entry' }, () => {
+test('a malformed KUMA_MCP_DENY_HOSTS entry is not echoed to the MCP client', async () => {
+  await withEnv({ KUMA_MCP_DENY_HOSTS: 'sup3r-secret entry' }, () => {
     const orig = console.error; let logged = '';
     console.error = (m: string) => { logged += m; };
     try { assert.throws(() => assertTargetAllowed({ hostname: 'example.com' }), (e: Error) => !/sup3r/.test(e.message) && /invalid entry/.test(e.message)); }
@@ -467,7 +467,7 @@ test('R5-1 NOTIFICATION_HOSTS: a portless entry allows only the scheme default p
     await assert.rejects(ntfy('https://svc.example/'), /NOTIFICATION_HOSTS/);       // needs at least one label before the suffix
     await assert.rejects(ntfy('https://x.evil-svc.example/'), /NOTIFICATION_HOSTS/);
   });
-  withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: '*,192.168.1.0/24,*lan.example,ok.example:70000,ok.example,*.ok.example:8080,[2001:db8::5]:443' }, () => {
+  await withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: '*,192.168.1.0/24,*lan.example,ok.example:70000,ok.example,*.ok.example:8080,[2001:db8::5]:443' }, () => {
     assert.deepEqual(invalidNotificationHostEntries(), ['*', '192.168.1.0/24', '*lan.example', 'ok.example:70000']);
   });
 });
@@ -515,8 +515,8 @@ test('R6-M1 ntfyserverurl must be the server root: a path, query or fragment wou
   await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://203.0.113.9/t' }), /server root/); // always, not only with NTFY_TOPICS
 });
 
-test('R6-L1 a *. glob in NOTIFICATION_HOSTS needs at least two labels after the star', () => {
-  withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: '*.com,*.example,*.lan.example,*.co.uk' }, () => {
+test('R6-L1 a *. glob in NOTIFICATION_HOSTS needs at least two labels after the star', async () => {
+  await withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: '*.com,*.example,*.lan.example,*.co.uk' }, () => {
     assert.deepEqual(invalidNotificationHostEntries(), ['*.com', '*.example']);
   });
 });
