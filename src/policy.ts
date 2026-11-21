@@ -391,6 +391,7 @@ function parseNotificationHostEntry(e: string): { host: string; port?: string; g
   if (m[4] !== undefined && !validPort(m[4])) return null;
   const host = (m[1] ?? m[3]).toLowerCase();
   if (m[1] !== undefined && ipv6ToBig(host) === null) return null;
+  if (m[2] && host.split('.').length < 2) return null; // `*.com` would match every .com host: a glob needs at least two labels after `*.`
   return { host, port: m[4] === undefined ? undefined : String(Number(m[4])), glob: !!m[2] };
 }
 
@@ -556,6 +557,14 @@ export async function assertNotificationConfigAllowed(config: Record<string, unk
     if (topics.length > 0 && !(typeof config.ntfytopic === 'string' && topics.includes(config.ntfytopic))) {
       throw new Error('notification config not allowed: the ntfy topic is not listed in KUMA_MCP_NTFY_TOPICS on the MCP server');
     }
+  }
+  if (type === 'ntfy' && typeof config.ntfyserverurl === 'string') {
+    // Kuma POSTs {topic: ntfytopic, ...} to ntfyserverurl; ntfy only honours that JSON topic at the server ROOT, and a POST
+    // to /<topic> publishes to that topic instead. A path, query or fragment would bypass KUMA_MCP_NTFY_TOPICS.
+    const v = config.ntfyserverurl.replace(/[\t\r\n]/g, '').trim();
+    let rootOnly = false;
+    try { const u = new URL(v); rootOnly = (u.pathname === '' || u.pathname === '/') && !v.includes('?') && !v.includes('#'); } catch { rootOnly = v === ''; }
+    if (!rootOnly) throw new Error('notification config not allowed: ntfyserverurl must be the server root (no path, query or fragment)');
   }
   const known = new Set<string>([...(spec.keys ?? []), ...(spec.multi ?? []), ...(spec.pair ?? []), ...(spec.skip ?? [])]);
   const notString = (k: string) => new Error(`notification config not allowed: "${k}" must be a plain string`);

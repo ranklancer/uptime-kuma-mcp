@@ -4,7 +4,7 @@ process.env.KUMA_INSTANCES = 'kuma';
 process.env.KUMA_BASE_URL = 'http://kuma.test:3001';
 process.env.KUMA_USERNAME ??= 'u';
 process.env.KUMA_PASSWORD ??= 'p';
-process.env.KUMA_MCP_NOTIFICATION_HOSTS = '203.0.113.9,203.0.113.9:80,203.0.113.9:25,203.0.113.9:587,*.example,*.example.com,*.test,rebind.example:8015,192.168.1.54:587'; // tests of the host list itself override this
+process.env.KUMA_MCP_NOTIFICATION_HOSTS = '203.0.113.9,203.0.113.9:80,203.0.113.9:25,203.0.113.9:587,ok.example,evil.example,nx.example,x.example,other.example,*.example.com,ntfy.test,n.test,h.test,rebind.example:8015,192.168.1.54:587'; // tests of the host list itself override this
 process.env.KUMA_MCP_NOTIFICATION_TYPES = 'ntfy,webhook,smtp,apprise,onebot,milky,nostr,pushover,serverchan,telegram,gotify,matrix,gorush,keep,pagertree,mattermost,brandnew,twilio';
 const { assertTargetAllowed, assertResolvedTargetAllowed, assertNotificationConfigAllowed, denyList, invalidNotificationHostEntries } = await import('../src/policy.js');
 const { buildAddPayload, buildEditPayload } = await import('../src/payload.js');
@@ -380,7 +380,7 @@ test('R4-H1 KUMA_MCP_NOTIFICATION_HOSTS: default empty refuses every destination
   await withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: '' }, async () => {
     delete process.env.KUMA_MCP_NOTIFICATION_HOSTS; // unset = default (none)
     await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://ntfy.sh' }, res({ 'ntfy.sh': ['203.0.113.9'] })), /KUMA_MCP_NOTIFICATION_HOSTS/);
-    await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'http://192.168.1.54:8015/api/x' }), /KUMA_MCP_NOTIFICATION_HOSTS/);
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'http://192.168.1.54:8015/' }), /KUMA_MCP_NOTIFICATION_HOSTS/);
     await assert.rejects(assertNotificationConfigAllowed({ type: 'smtp', smtpHost: 'mail.example.com', smtpPort: 587 }, res({ 'mail.example.com': ['203.0.113.9'] })), /KUMA_MCP_NOTIFICATION_HOSTS/);
     await assert.rejects(assertNotificationConfigAllowed({ type: 'apprise', appriseURL: 'json://203.0.113.9/x' }), /KUMA_MCP_NOTIFICATION_HOSTS/);
     await assertNotificationConfigAllowed({ type: 'apprise', appriseURL: 'tgram://123456:ABCdef/987' }); // fixed external service: exempt
@@ -502,4 +502,21 @@ test('R5-4 ntfyIcon goes through the host list and denylist; ntfyCall needs writ
   await assert.rejects(assertNotificationConfigAllowed({ ...base, ntfyCall: '+15551234567' }), /ALLOW_WRITE_METHODS/);
   await assertNotificationConfigAllowed({ ...base, ntfyCall: '' });
   await withEnv({ KUMA_MCP_ALLOW_WRITE_METHODS: '1' }, () => assertNotificationConfigAllowed({ ...base, ntfyCall: '+15551234567' }));
+});
+
+// ── review round 6 ──────────────────────────────────────────────────────────
+test('R6-M1 ntfyserverurl must be the server root: a path, query or fragment would bypass KUMA_MCP_NTFY_TOPICS', async () => {
+  const ntfy = (ntfyserverurl: string) => assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl, ntfytopic: 'kuma-alerts' });
+  await withEnv({ KUMA_MCP_NTFY_TOPICS: 'kuma-alerts' }, async () => {
+    for (const u of ['https://203.0.113.9/attacker-topic', 'https://203.0.113.9/?x=1', 'https://203.0.113.9?x=1', 'https://203.0.113.9/#t', 'https://203.0.113.9/?', 'https://203.0.113.9//x', 'https://203.0.113.9/\tattacker'])
+      await assert.rejects(ntfy(u), /server root/, u);
+    await ntfy('https://203.0.113.9'); await ntfy('https://203.0.113.9/');
+  });
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://203.0.113.9/t' }), /server root/); // always, not only with NTFY_TOPICS
+});
+
+test('R6-L1 a *. glob in NOTIFICATION_HOSTS needs at least two labels after the star', () => {
+  withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: '*.com,*.example,*.lan.example,*.co.uk' }, () => {
+    assert.deepEqual(invalidNotificationHostEntries(), ['*.com', '*.example']);
+  });
 });
