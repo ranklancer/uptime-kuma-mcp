@@ -605,3 +605,29 @@ test('R8 legit hosts still pass parseTarget: underscore name, IDN, IPv6 with por
       { try { assertTargetAllowed(t); await assertResolvedTargetAllowed(t, res({})); } catch (e: any) { assert.fail(JSON.stringify(t) + ' ' + e.message); } }
   });
 });
+
+// ── review round 9 ──────────────────────────────────────────────────────────
+test('R9-B1 an empty host in the raw authority is refused (legacy url.parse gives hostname "" which http.request turns into localhost)', async () => {
+  await withEnv({ KUMA_MCP_ALLOW_HOSTS: '*.rebhahnomicon.com,grafana' }, async () => {
+    for (const u of ['http:///grafana:3000/', 'http://\\grafana:3000/', 'https:///hass.rebhahnomicon.com', 'http://:80/', 'http://@/x'])
+      await assert.rejects(async () => { const t = { url: u }; assertTargetAllowed(t); await assertResolvedTargetAllowed(t, res({})); }, /not allowed/, u);
+  });
+});
+
+test('R9-S1 tab/CR/LF inside a host is refused, not stripped (monitor url and notification destinations)', async () => {
+  await withEnv({ KUMA_MCP_ALLOW_HOSTS: '*.rebhahnomicon.com', KUMA_MCP_DENY_HOSTS: 'vaultwarden', KUMA_MCP_NOTIFICATION_HOSTS: '192.168.1.54:8088,*.rebhahnomicon.com' }, async () => {
+    for (const u of ['http://vaultwarden\t.rebhahnomicon.com/', 'http://vaultwarden\n.rebhahnomicon.com/', 'http://a.rebhahnomicon.com/\t'.replace('/\t', '\t/x')])
+      assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, JSON.stringify(u));
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfytopic: 't', ntfyserverurl: 'http://192.168.1.54\t:8088' }, res({})), /not allowed/);
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', httpMethod: 'GET', webhookURL: 'https://vaultwarden\t.rebhahnomicon.com/' }, res({})), /whitespace|not allowed/);
+  });
+});
+
+test('R9-N ntfyserverurl userinfo is refused; very short globs (*e*, a*) are invalid host entries', async () => {
+  const { invalidAllowEntries } = await import('../src/policy.js');
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfytopic: 't', ntfyserverurl: 'https://x@ntfy.example' }), /server root/);
+  await withEnv({ KUMA_MCP_ALLOW_HOSTS: '*e*,a*,*com*,*,*x*.com,*mcp*,*bifrost*,*.lan' }, async () => {
+    for (const b of ['*e*', 'a*', '*']) assert.ok(invalidAllowEntries().includes(b), b);
+    for (const g of ['*mcp*', '*bifrost*', '*.lan']) assert.ok(!invalidAllowEntries().includes(g), g);
+  });
+});

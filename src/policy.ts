@@ -79,7 +79,7 @@ const CCSLD = /^(?:co|com|org|net|gov|edu|ac|or|ne|go|gob|mil|nom|ltd|plc|sch|gv
 export function wildcardProblem(entry: string): string | null {
   const e = entry.toLowerCase().replace(/:\d{1,5}$/, '');
   if (/[a-z0-9_-]\.$/.test(e)) return 'trailing dot (target hosts never carry one, so this entry would silently never match)';
-  if (e === '*') return 'bare * (matches every host)';
+  if (e.includes('*') && e.replace(/[*.]/g, '').length < 3) return 'glob with fewer than 3 literal characters (matches almost every host)';
   if (/\*\*/.test(e) || /^\*\.[^:]*\*/.test(e)) return 'multi-star wildcard (matches far more than one domain)';
   // `*.suffix`, or a glued form like `*com` / `*o.uk` (a star prefix on the first label): judge the suffix after the star's label.
   const m = /^\*\.([a-z0-9_.-]+)$/.exec(e) ?? (/\*$/.test(e) ? null : /^\*[a-z0-9_-]*(?:\.([a-z0-9_.-]+))?$/.exec(e));
@@ -243,11 +243,12 @@ function parseTarget(raw: string): { host: string; port: string } | null {
   if ((s.match(/:/g) ?? []).length >= 2 && /^[0-9a-f:.]+$/i.test(s)) s = `[${s}]`; // bare IPv6 literal
   const sch = /^([a-z][a-z0-9+.-]*):(\/\/|(?!\d))/i.exec(s);
   if (sch && !ALLOWED_SCHEMES.includes(sch[1].toLowerCase())) return null; // file:, gopher:, ftp:, javascript:, ...
+  if (/[\t\r\n]/.test(s)) return null; // the URL parser would delete these, an older one would end the host there: refuse, do not strip
   try {
     // Check the RAW authority too: WHATWG percent-decodes the host (vaultwarden%2eattacker.example -> vaultwarden.attacker.example)
     // while Node's legacy url.parse stops at the `%`, so the host checked would not be the host Kuma connects to.
     const rawAuth = (sch ? s : 'http://' + s).replace(/[\t\r\n]/g, '').replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split(/[/\\?#]/)[0].replace(/^.*@/, '');
-    if (!/^(?:[a-z0-9._\u0080-\uffff-]*|\[[0-9a-f:.]+\])(?::\d{0,5})?$/i.test(rawAuth)) return null;
+    if (!/^(?:[a-z0-9._\u0080-\uffff-]+|\[[0-9a-f:.]+\])(?::\d{0,5})?$/i.test(rawAuth)) return null;
     const u = new URL(sch ? s : 'http://' + s);
     // Collapse any run of trailing dots (localhost.. resolves like localhost).
     let host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
@@ -531,8 +532,10 @@ function* stringLeaves(v: unknown, depth = 0): Generator<string> {
 async function checkNotificationDestination(raw: string, resolve: Resolver | undefined, opts: { multi?: boolean; apprise?: boolean } = {}): Promise<void> {
   // The URL parser (axios) deletes tab/CR/LF anywhere in a URL and %-encodes other whitespace: a space or
   // line break can hide a different host, so only newline-separated multi-value fields keep their separators.
-  const s = (opts.multi ? raw.replace(/\t/g, '') : raw.replace(/[\t\r\n]/g, '')).replace(/^ +| +$/g, '');
+  // Tab/CR/LF are REFUSED, not stripped: older URL parsers end the host at a tab, so the host checked here could differ from the one Kuma connects to.
+  const s = raw.replace(/^ +| +$/g, '');
   if (s === '') return;
+  if (/\t/.test(s) || (!opts.multi && /[\r\n]/.test(s))) throw new Error('notification config not allowed: destination contains whitespace or control characters');
   if (/\s/.test(s) || HIDDEN_TEST.test(s)) throw new Error('notification config not allowed: destination contains whitespace or control characters');
   if (opts.apprise) {
     // apprise splits one value into several URLs on whitespace, commas and semicolons: only a single URL is accepted.
@@ -604,7 +607,7 @@ export async function assertNotificationConfigAllowed(config: Record<string, unk
     // to /<topic> publishes to that topic instead. A path, query or fragment would bypass KUMA_MCP_NTFY_TOPICS.
     // An empty/missing value makes Kuma fall back to a default it picks itself (a blind request), so it is refused too.
     // The check is on the RAW text: URL parsing would normalise `/.`, `/..` and `\x` into something that looks like a root.
-    const v = typeof config.ntfyserverurl === 'string' ? config.ntfyserverurl.replace(/[\t\r\n]/g, '').trim() : '';
+    const v = typeof config.ntfyserverurl === 'string' ? config.ntfyserverurl.trim() : '';
     if (v === '') throw new Error('notification config not allowed: ntfy needs ntfyserverurl set to the server root (an empty value makes Kuma pick a default)');
     if (!/^[a-z][a-z0-9+.-]*:\/\/[a-z0-9._~:\[\]-]+\/?$/i.test(v)) throw new Error('notification config not allowed: ntfyserverurl must be the server root (no path, query or fragment)');
   }
