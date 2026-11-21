@@ -168,6 +168,8 @@ export class UptimeKumaClient {
       }
     });
 
+    this.attachCacheHandlers(this.socket);
+
     // Listen for notification list pushes. Uptime Kuma emits 'notificationList'
     // after login and on every notification change — directly analogous to the
     // monitorList event above. This is the reliable source of truth (there is
@@ -344,6 +346,20 @@ export class UptimeKumaClient {
     this.heartbeatStatusCache.clear();
     this.notificationCache = [];
     this.notificationCacheReady = false;
+  }
+
+  /** Keep the monitor cache in step with Kuma's incremental pushes. */
+  private attachCacheHandlers(socket: any): void {
+    // Incremental monitor changes. Kuma emits the full 'monitorList' only on login; later adds/edits
+    // arrive as 'updateMonitorIntoList' (object keyed by id) and deletes as 'deleteMonitorFromList' (id).
+    // Without these the cache goes stale: new monitors are invisible to list_monitors until a reconnect.
+    socket.on('updateMonitorIntoList', (data: Record<string, any>) => {
+      if (data && typeof data === 'object') Object.assign(this.monitorCache, data);
+    });
+    socket.on('deleteMonitorFromList', (id: number | string) => {
+      delete this.monitorCache[String(id)];
+      this.heartbeatStatusCache.delete(Number(id));
+    });
   }
 
   // ── Read operations ─────────────────────────────────────────
