@@ -357,7 +357,7 @@ test('R3-5b editMonitor surfaces the notes in its response', async () => {
   const client: any = Object.create(UptimeKumaClient.prototype);
   client.cfg = { name: 't' };
   client.ensureConnected = async () => {};
-  process.env.KUMA_MCP_ALLOW_HOSTS = '*';
+  process.env.KUMA_MCP_ALLOW_HOSTS = '*.test,*.example,*.lan,*.local,*.internal,*.example.com';
   client.emitWithAck = async (ev: string) => ev === 'getMonitor' ? { ok: true, monitor: { ...cur, maxredirects: 10 } } : { ok: true, msg: 'ok', monitorID: 5 };
   const out = await client.editMonitor(5, { url: 'https://o.example.test/' });
   assert.match(out.notes[0], /maxredirects was reduced/);

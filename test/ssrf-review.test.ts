@@ -284,7 +284,7 @@ test('R2-12 IDN hostnames are validated in punycode form', () => {
 
 // reviewer note: the allow-list can never un-deny loopback / built-ins / operator deny entries
 test('allow-list never un-denies loopback, built-in names or KUMA_MCP_DENY_HOSTS entries', async () => {
-  await withEnv({ KUMA_MCP_ALLOW_HOSTS: '*', KUMA_MCP_DENY_HOSTS: 'gw.lan:8080', KUMA_MCP_DENY_PRIVATE: '1' }, async () => {
+  await withEnv({ KUMA_MCP_ALLOW_HOSTS: '*.test,*.example,*.lan,*.local,*.internal,*.example.com', KUMA_MCP_DENY_HOSTS: 'gw.lan:8080', KUMA_MCP_DENY_PRIVATE: '1' }, async () => {
     for (const t of [{ hostname: 'localhost' }, { hostname: '127.0.0.1' }, { hostname: 'bifrost' }, { url: 'http://mcp-gateway/' }, { hostname: '169.254.169.254' }, { url: 'http://gw.lan:8080/' }])
       assert.throws(() => assertTargetAllowed(t), /denylist/, JSON.stringify(t));
     await assert.rejects(assertResolvedTargetAllowed({ hostname: 'svc' }, res({ svc: ['127.0.0.1'] })), /denylisted/);
@@ -576,5 +576,32 @@ test('R7-e multi-star, single-label and IP-embedding wildcards are rejected; pri
   await withEnv({ KUMA_MCP_ALLOW_HOSTS: [...bad, ...good].join(',') }, async () => {
     for (const b of bad) assert.ok(invalidAllowEntries().includes(b), b);
     for (const g of good) assert.ok(!invalidAllowEntries().includes(g), g);
+  });
+});
+
+// ── review round 8 ──────────────────────────────────────────────────────────
+test('R8-B1 percent-encoded host characters are refused (WHATWG decodes, legacy url.parse stops at %)', async () => {
+  await withEnv({ KUMA_MCP_ALLOW_HOSTS: '*.rebhahnomicon.com,*.attacker.example', KUMA_MCP_DENY_HOSTS: 'vaultwarden,dockge,localhost', KUMA_MCP_DENY_PRIVATE: '1' }, async () => {
+    for (const u of ['http://vaultwarden%2erebhahnomicon.com/admin', 'http://vaultwarden%2eattacker.example/admin', 'https://dockge%2eattacker.example/', 'http://%6cocalhost.attacker.example/', 'http://a%2db.rebhahnomicon.com/'])
+      await assert.rejects(async () => { const t = { url: u }; assertTargetAllowed(t); await assertResolvedTargetAllowed(t, res({})); }, /not allowed/, u);
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'gotify', gotifyserverurl: 'http://vaultwarden%2elan.example/' }, res({})), /not allowed/);
+    const t = { url: 'https://grafana.rebhahnomicon.com/x?q=%2e' }; assertTargetAllowed(t); await assertResolvedTargetAllowed(t, res({})); // % in the path/query is fine
+  });
+});
+
+test('R8-S1 bare * and glued/trailing-dot ALLOW/DENY entries are rejected; legit homelab entries stay', async () => {
+  const { invalidAllowEntries, invalidDenyEntries } = await import('../src/policy.js');
+  const bad = ['*', '*com', '*o.uk', '*.co.uk.', 'vaultwarden.', '*.com.'];
+  const good = ['*.rebhahnomicon.com', '*.lan', '*bifrost*', '*mcp*', '*.localhost', '192.168.1.0/24', 'n8n', 'n8n:5678', '[2001:db8::1]:8080'];
+  await withEnv({ KUMA_MCP_ALLOW_HOSTS: [...bad, ...good].join(','), KUMA_MCP_DENY_HOSTS: [...bad, ...good].join(',') }, async () => {
+    for (const b of bad) { assert.ok(invalidAllowEntries().includes(b), `allow ${b}`); assert.ok(invalidDenyEntries().includes(b), `deny ${b}`); }
+    for (const g of good) { assert.ok(!invalidAllowEntries().includes(g), g); assert.ok(!invalidDenyEntries().includes(g), g); }
+  });
+});
+
+test('R8 legit hosts still pass parseTarget: underscore name, IDN, IPv6 with port, bare host:port', async () => {
+  await withEnv({ KUMA_MCP_ALLOW_HOSTS: 'my_svc,xn--bcher-kva.example.com,[2001:db8::1],db' }, async () => {
+    for (const t of [{ url: 'http://my_svc:8080/' }, { url: 'https://bücher.example.com/' }, { url: 'http://[2001:db8::1]:8080/' }, { hostPort: 'db:5432' }])
+      { try { assertTargetAllowed(t); await assertResolvedTargetAllowed(t, res({})); } catch (e: any) { assert.fail(JSON.stringify(t) + ' ' + e.message); } }
   });
 });
