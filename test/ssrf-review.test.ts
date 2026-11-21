@@ -474,7 +474,7 @@ test('R5-1 NOTIFICATION_HOSTS: a portless entry allows only the scheme default p
 });
 
 test('R5-5 a scheme-less host:port destination (hostPort branch) must be listed WITH its port; portless entries do not match it', async () => {
-  const gotify = (v: string) => assertNotificationConfigAllowed({ type: 'gotify', gotifyserverurl: v }, res({}));
+  const gotify = (v: string) => assertNotificationConfigAllowed({ type: 'onebot', httpAddr: v }, res({})); // httpAddr is the one URL field a provider prefixes itself, so it may be scheme-less
   await withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: 'g.example:8080,h.example', KUMA_MCP_ALLOW_HOSTS: '*.example' }, async () => {
     await gotify('g.example:8080');
     await assert.rejects(gotify('g.example:9090'), /NOTIFICATION_HOSTS/);
@@ -655,4 +655,22 @@ test('R10-N3/N4 backslash in an apprise URL refused; post-parse hostname charset
     await assert.rejects(assertNotificationConfigAllowed({ type: 'apprise', appriseURL: 'jsons://ntfy.rebhahnomicon.com:443\\@192.168.1.54:8015/' }, res({})), /backslash|not allowed/);
   });
   for (const u of ['http://n8n＊/', 'http://a＄b/']) assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, u);
+});
+
+// ── review round 11 ─────────────────────────────────────────────────────────
+test('R11-S1 an address the parser reads as IPv4 must be written canonically, hex letters included', async () => {
+  await withEnv({ KUMA_MCP_DENY_HOSTS: '192.168.1.54:8015' }, async () => {
+    for (const u of ['http://0xc0.0xa8.0x1.054:8015/', 'http://0xa.0.0.1/', 'http://0xc0.0xa8.1.54:8088/'])
+      assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, u);
+    for (const t of [{ hostname: '0xa.0.0.1' }, { hostPort: '0xc0.0xa8.1.54:25' }]) assert.throws(() => assertTargetAllowed(t), /not allowed/, JSON.stringify(t));
+    assertTargetAllowed({ url: 'http://cafe.face:80/' }); assertTargetAllowed({ url: 'http://192.168.1.55/' }); // names that merely look hex stay fine
+  });
+});
+
+test('R11-S2 scheme-less host:port in a single-value URL field is refused (legacy parser reads the host as the protocol)', async () => {
+  await withEnv({ KUMA_MCP_NOTIFICATION_TYPES: 'webhook,gotify,ntfy', KUMA_MCP_NOTIFICATION_HOSTS: '192.168.1.54:8088,ntfy.rebhahnomicon.com:443', KUMA_MCP_ALLOW_HOSTS: '*.rebhahnomicon.com,192.168.1.54' }, async () => {
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', httpMethod: 'GET', webhookURL: '192.168.1.54:8088' }, res({})), /must start with http/);
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'gotify', gotifyserverurl: 'ntfy.rebhahnomicon.com:443' }, res({})), /must start with http/);
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfytopic: 't', ntfyserverurl: 'https://ntfy.rebhahnomicon.com', ntfyIcon: '192.168.1.54:8088' }, res({})), /must start with http/);
+  });
 });

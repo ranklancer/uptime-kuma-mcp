@@ -255,6 +255,8 @@ function parseTarget(raw: string): { host: string; port: string } | null {
     const u = new URL(sch ? s : 'http://' + s);
     // Collapse any run of trailing dots (localhost.. resolves like localhost).
     let host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
+    // An address the parser read as IPv4 must have been WRITTEN in canonical dotted-decimal (0xc0.0xa8.0x1.054 parses as 192.168.1.44 but resolvers differ).
+    if (ipv4ToInt(host) !== null && rawHost.toLowerCase().replace(/\.+$/, '') !== host) return null;
     // IPv4-mapped (::ffff:a:b) and IPv4-translated (::ffff:0:a:b) forms embed an IPv4 address.
     const mapped = /^::ffff:(?:0:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
     if (mapped) {
@@ -532,7 +534,7 @@ function* stringLeaves(v: unknown, depth = 0): Generator<string> {
   else if (typeof v === 'object') for (const x of Object.values(v as Record<string, unknown>)) yield* stringLeaves(x, depth + 1);
 }
 
-async function checkNotificationDestination(raw: string, resolve: Resolver | undefined, opts: { multi?: boolean; apprise?: boolean } = {}): Promise<void> {
+async function checkNotificationDestination(raw: string, resolve: Resolver | undefined, opts: { multi?: boolean; apprise?: boolean; schemeOptional?: boolean } = {}): Promise<void> {
   // The URL parser (axios) deletes tab/CR/LF anywhere in a URL and %-encodes other whitespace: a space or
   // line break can hide a different host, so only newline-separated multi-value fields keep their separators.
   // Tab/CR/LF are REFUSED, not stripped: older URL parsers end the host at a tab, so the host checked here could differ from the one Kuma connects to.
@@ -561,7 +563,7 @@ async function checkNotificationDestination(raw: string, resolve: Resolver | und
   }
   const sch = /^([a-z][a-z0-9+.-]*):\/\//i.exec(s);
   if (sch && !ALLOWED_SCHEMES.includes(sch[1].toLowerCase())) throw new Error('notification config not allowed: destination scheme must be http, https, ws or wss');
-  if (!sch && /[/?#@\\]/.test(s)) {
+  if (!sch && !opts.multi && !opts.schemeOptional && (/[/?#@\\]/.test(s) || /:\d/.test(s))) {
     // Without a scheme Kuma's HTTP client sends the request to localhost:80 (path = the whole value), not to the host written here.
     throw new Error('notification config not allowed: a URL destination must start with http://, https://, ws:// or wss://');
   }
@@ -625,7 +627,7 @@ export async function assertNotificationConfigAllowed(config: Record<string, unk
     const v = config[k];
     if (v === undefined || v === null) continue;
     if (typeof v !== 'string') throw notString(k);
-    await checkNotificationDestination(v, resolve, { apprise: type === 'apprise' });
+    await checkNotificationDestination(v, resolve, { apprise: type === 'apprise', schemeOptional: k === 'httpAddr' });
   }
   for (const k of spec.multi ?? []) {
     const v = config[k];
