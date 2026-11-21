@@ -256,6 +256,9 @@ export function redactMonitorAck(res: any): any {
 /** Heartbeat msg is cut to this many characters before any scan (pusher-controlled length). */
 export const HEARTBEAT_MSG_CAP = 1024;
 
+/** Monitor types whose heartbeat msg echoes data the check received (MQTT payload, gRPC response, DB query result, SIP reply): msg is withheld for them. */
+export const RESPONSE_ECHO_TYPES = ['mqtt', 'grpc-keyword', 'grpc', 'mysql', 'sqlserver', 'postgres', 'mongodb', 'redis', 'oracledb', 'sip-options', 'rabbitmq'];
+
 export function sanitizeHeartbeatMsg(input: unknown): unknown {
   if (typeof input !== 'string') return input;
   const msg: string = input.length > HEARTBEAT_MSG_CAP ? input.slice(0, HEARTBEAT_MSG_CAP) + '...[truncated]' : input;
@@ -274,7 +277,7 @@ export function sanitizeHeartbeatMsg(input: unknown): unknown {
   return safe.replace(/[a-z][a-z0-9+.-]{0,31}:\/\/[^\s"'<>]+/gi, (m) => String(scrubUrl(m)));
 }
 
-export function redactHeartbeatAck(res: any): any {
+export function redactHeartbeatAck(res: any, monitorType?: string): any {
   if (!res || typeof res !== 'object') return res;
   const out: Record<string, unknown> = {};
   for (const k of ['ok', 'msgi18n'] as const) if (k in res) out[k] = res[k];
@@ -285,7 +288,7 @@ export function redactHeartbeatAck(res: any): any {
           if (!row || typeof row !== 'object' || Array.isArray(row)) return REDACTED;
           const r: Record<string, unknown> = {};
           for (const [k, v] of Object.entries(row)) {
-            if (k === 'msg') r.msg = sanitizeHeartbeatMsg(v);
+            if (k === 'msg') r.msg = monitorType !== undefined && RESPONSE_ECHO_TYPES.includes(monitorType) ? WITHHELD : sanitizeHeartbeatMsg(v);
             else if (v === null || typeof v === 'number' || typeof v === 'boolean' || k === 'time' || k === 'end_time') r[k] = v;
           }
           return r;

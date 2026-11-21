@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+process.env.KUMA_MCP_NOTIFICATION_TYPES = 'ntfy,pushover,pushbullet';
 process.env.KUMA_MCP_ALLOW_HOSTS = '*'; // these tests use fictional names the system resolver cannot see
 import {
   scrubUrl, redactMonitor, redactNotification, redactHeartbeatAck, sanitizeHeartbeatMsg,

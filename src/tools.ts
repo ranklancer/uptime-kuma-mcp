@@ -131,7 +131,7 @@ function cronSilencesLong(expr: string, duration: number): boolean {
   if (!mi || !h || !dom || !mon || !dow) return true;
   const start = Date.UTC(2030, 0, 7); // a Monday
   const wins: Array<[number, number]> = [];
-  for (let t = 0; t < 8 * 1440; t++) {
+  for (let t = -duration; t < 8 * 1440; t++) { // start one window early so a window that began before t=0 is counted
     const d = new Date(start + t * 60000);
     if (!mi.has(d.getUTCMinutes()) || !h.has(d.getUTCHours()) || !mon.has(d.getUTCMonth() + 1)) continue;
     const domOk = dom.has(d.getUTCDate()), dowOk = dow.has(d.getUTCDay());
@@ -159,14 +159,14 @@ export function maintenanceNeedsConfirm(a: {
   if (a.monitorIds.length > 5) return true;
   const DAY_MS = 24 * 3600 * 1000;
   switch (a.strategy) {
-    case 'manual': return !a.dateRange?.[1];
+    case 'manual': return true; // active until someone pauses it: always confirm, whatever dateRange says
     case 'single': {
       const [s, e] = a.dateRange ?? [];
       if (!e) return true;
       const span = s ? Date.parse(e.replace(' ', 'T')) - Date.parse(s.replace(' ', 'T')) : Infinity;
       return !(span < DAY_MS); // NaN (unparseable) also needs confirm
     }
-    case 'cron': return a.cron ? cronSilencesLong(a.cron, a.durationMinutes ?? 60) : true;
+    case 'cron': return !a.cron || (a.durationMinutes ?? 60) >= LONG_SILENCE_MIN || cronSilencesLong(a.cron, a.durationMinutes ?? 60);
     default: {
       if (!a.timeRange) return false; // the handler substitutes the 02:00-03:00 default
       const [s, e] = a.timeRange;
@@ -559,7 +559,7 @@ export const toolDefs: ToolDef[] = [
       active:         z.boolean().optional().default(true),
       monitorIds:     z.array(z.number().int().positive()).optional().default([]).describe('Monitors affected by this window'),
       dateRange:      z.tuple([z.string().nullable(), z.string().nullable()]).optional().describe('[start, end] as "YYYY-MM-DD HH:mm:ss" (single strategy; null = unbounded)'),
-      timeRange:      z.tuple([z.object({ hours: z.number().int(), minutes: z.number().int() }), z.object({ hours: z.number().int(), minutes: z.number().int() })]).optional().describe('[start, end] time of day for recurring strategies'),
+      timeRange:      z.tuple([z.object({ hours: z.number().int().min(0).max(23), minutes: z.number().int().min(0).max(59) }), z.object({ hours: z.number().int().min(0).max(23), minutes: z.number().int().min(0).max(59) })]).optional().describe('[start, end] time of day for recurring strategies'),
       weekdays:       z.array(z.number().int().min(1).max(7)).optional().default([]).describe('1=Mon..7=Sun (recurring-weekday)'),
       daysOfMonth:    z.array(z.union([z.number().int().min(1).max(31), z.literal('lastDay1')])).optional().default([]),
       intervalDay:    z.number().int().positive().optional().default(1).describe('Every N days (recurring-interval)'),

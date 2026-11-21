@@ -142,7 +142,8 @@ const TYPE_ONLY_FIELDS: Array<{ types: string[]; reset: Record<string, unknown> 
 
 /** Headers that steer virtual-host routing or method/URL rewriting behind a reverse proxy: refused (M2). */
 const FORBIDDEN_HEADERS = ['host', 'x-forwarded-host', 'x-original-url', 'x-rewrite-url', 'x-http-method-override',
-  'x-forwarded-for', 'x-real-ip', 'forwarded', 'x-original-host'];
+  'x-forwarded-for', 'x-real-ip', 'forwarded', 'x-original-host', 'x-forwarded-proto', 'x-forwarded-port', 'x-forwarded-prefix',
+  'x-forwarded-server', 'true-client-ip', 'cf-connecting-ip', 'x-client-ip'];
 
 function refuseHeader(name: unknown): void {
   const n = String(name).replace(/\s/g, '').toLowerCase();

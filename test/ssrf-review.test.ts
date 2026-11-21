@@ -4,6 +4,7 @@ process.env.KUMA_INSTANCES = 'kuma';
 process.env.KUMA_BASE_URL = 'http://kuma.test:3001';
 process.env.KUMA_USERNAME ??= 'u';
 process.env.KUMA_PASSWORD ??= 'p';
+process.env.KUMA_MCP_NOTIFICATION_TYPES = 'ntfy,webhook,smtp,apprise,onebot,milky,nostr,pushover,serverchan,telegram,gotify,matrix,gorush,keep,pagertree,mattermost,brandnew,twilio';
 const { assertTargetAllowed, assertResolvedTargetAllowed, assertNotificationConfigAllowed, denyList } = await import('../src/policy.js');
 const { buildAddPayload, buildEditPayload } = await import('../src/payload.js');
 const { sanitizeHeartbeatMsg } = await import('../src/redact.js');
@@ -28,32 +29,33 @@ await stubClient();
 // H1 ── notification config policy
 test('H1 notification config: destination fields of the provider type go through the denylist and resolve check', async () => {
   for (const cfg of [
-    { type: 'webhook', webhookURL: 'http://127.0.0.1:8015/hook' },
-    { type: 'webhook', webhookURL: 'http://bifrost:8080/x' },
+    { type: 'webhook', httpMethod: 'GET', webhookURL: 'http://127.0.0.1:8015/hook' },
+    { type: 'webhook', httpMethod: 'GET', webhookURL: 'http://bifrost:8080/x' },
     { type: 'ntfy', ntfyserverurl: 'http://169.254.169.254/' },
     { type: 'smtp', smtpHost: 'localhost', smtpPort: 25 },
     { type: 'apprise', appriseURL: 'json://127.0.0.1:9000/x' },
   ]) await assert.rejects(assertNotificationConfigAllowed(cfg), /not allowed/, JSON.stringify(cfg));
-  await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', webhookURL: 'https://evil.example/h' }, res({ 'evil.example': ['127.0.0.1'] })), /denylisted/);
-  await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', webhookURL: 'https://nx.example/h' }, res({})), /could not be resolved/);
-  await assertNotificationConfigAllowed({ type: 'webhook', webhookURL: 'https://ok.example/h' }, res({ 'ok.example': ['203.0.113.9'] }));
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', httpMethod: 'GET', webhookURL: 'https://evil.example/h' }, res({ 'evil.example': ['127.0.0.1'] })), /denylisted/);
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', httpMethod: 'GET', webhookURL: 'https://nx.example/h' }, res({})), /could not be resolved/);
+  await assertNotificationConfigAllowed({ type: 'webhook', httpMethod: 'GET', webhookURL: 'https://ok.example/h' }, res({ 'ok.example': ['203.0.113.9'] }));
   await assertNotificationConfigAllowed({ type: 'apprise', appriseURL: 'tgram://tok/123' });
 });
 
 test('H1 webhook custom body / additional headers / non-GET method refused unless KUMA_MCP_ALLOW_WRITE_METHODS=1', async () => {
-  const base = { type: 'webhook', webhookURL: 'https://203.0.113.9/h' };
+  const base = { type: 'webhook', httpMethod: 'GET', webhookURL: 'https://203.0.113.9/h' };
   await assert.rejects(assertNotificationConfigAllowed({ ...base, webhookCustomBody: '{"a":"{{msg}}"}' }), /ALLOW_WRITE_METHODS/);
   await assert.rejects(assertNotificationConfigAllowed({ ...base, webhookAdditionalHeaders: '{"X":"y"}' }), /ALLOW_WRITE_METHODS/);
-  for (const m of ['PUT', 'delete', 'POST']) await assert.rejects(assertNotificationConfigAllowed({ ...base, httpMethod: m }), /GET\/HEAD/, m);
-  await assertNotificationConfigAllowed({ ...base, httpMethod: 'GET' });
+  for (const m of ['PUT', 'delete', 'POST', 'HEAD']) await assert.rejects(assertNotificationConfigAllowed({ ...base, httpMethod: m }), /httpMethod to GET/, m);
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', webhookURL: 'https://203.0.113.9/h' }), /httpMethod to GET/); // missing = POST in Kuma
+  await assertNotificationConfigAllowed({ ...base, httpMethod: 'get' });
   await withEnv({ KUMA_MCP_ALLOW_WRITE_METHODS: '1' }, () => assertNotificationConfigAllowed({ ...base, webhookCustomBody: '{}', httpMethod: 'PUT' }));
 });
 
 // review round 2, blocking 1: whitespace
 test('R2-1 tab/CR/LF inside a destination is stripped before the check (the URL parser deletes them); other whitespace is refused', async () => {
   for (const v of ['http://127.0.0.1\t:8015/', 'http://127.0.\n0.1/', 'http://local\rhost/', 'http://127.0.0.1\t/x'])
-    await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', webhookURL: v }), /denylist|not allowed/, JSON.stringify(v));
-  await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', webhookURL: 'http://203.0.113.9/a b' }), /whitespace/);
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', httpMethod: 'GET', webhookURL: v }), /denylist|not allowed/, JSON.stringify(v));
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', httpMethod: 'GET', webhookURL: 'http://203.0.113.9/a b' }), /whitespace/);
 });
 
 // blocking 2: per-type table
@@ -63,6 +65,7 @@ test('R2-2 per-type destination table: httpAddr, nostr relays, unknown types and
   await assert.rejects(assertNotificationConfigAllowed({ type: 'nostr', relays: 'wss://203.0.113.9/r\nws://127.0.0.1:8015' }), /denylist/);
   await assert.rejects(assertNotificationConfigAllowed({ type: 'nostr', nostrRelays: 'ws://127.0.0.1:8015,wss://203.0.113.9' }), /denylist/);
   await assert.rejects(assertNotificationConfigAllowed({ type: 'brandnew', foo: 'x' }), /not on the supported list/);
+  for (const t of ['__proto__', 'constructor', 'toString']) await assert.rejects(assertNotificationConfigAllowed({ type: t }), /not enabled/, t);
   await assert.rejects(assertNotificationConfigAllowed({ type: 'pushover', somethingElse: 'http://127.0.0.1:8015/' }), /not a known destination field/);
   await assert.rejects(assertNotificationConfigAllowed({ type: 'pushover', nested: { deep: ['grafana:3000'] } }), /not a known destination field/);
   // ServerChan: a send key is not a host
@@ -285,4 +288,88 @@ test('allow-list never un-denies loopback, built-in names or KUMA_MCP_DENY_HOSTS
       assert.throws(() => assertTargetAllowed(t), /denylist/, JSON.stringify(t));
     await assert.rejects(assertResolvedTargetAllowed({ hostname: 'svc' }, res({ svc: ['127.0.0.1'] })), /denylisted/);
   });
+});
+
+// ── review round 3 ──────────────────────────────────────────────────────────
+test('R3 type allow-list: default is ntfy only; other types and type changes need KUMA_MCP_NOTIFICATION_TYPES', async () => {
+  await withEnv({ KUMA_MCP_NOTIFICATION_TYPES: '' }, async () => { delete process.env.KUMA_MCP_NOTIFICATION_TYPES; // unset = default
+    await assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://203.0.113.9/', ntfyAuthenticationMethod: 'none', ntfyIcon: 'https://x.example/i.png' });
+    for (const t of ['webhook', 'apprise', 'gotify', 'smtp', 'slack']) await assert.rejects(assertNotificationConfigAllowed({ type: t }), /KUMA_MCP_NOTIFICATION_TYPES/, t);
+  });
+  const { UptimeKumaClient } = await import('../src/uptime-kuma-client.js');
+  const c: any = Object.create(UptimeKumaClient.prototype);
+  c.cfg = { name: 't' }; c.ensureConnected = async () => {};
+  let sent = 0; c.emitWithAck = async () => { sent++; return { ok: true, id: 1 }; };
+  c.getNotification = async () => ({ id: 1, name: 'n', config: { type: 'ntfy', ntfytopic: 't' } });
+  await withEnv({ KUMA_MCP_NOTIFICATION_TYPES: 'ntfy' }, async () => {
+    await assert.rejects(c.updateNotification(1, { type: 'webhook' }), /KUMA_MCP_NOTIFICATION_TYPES/); // type change to a disabled type
+  });
+  assert.equal(sent, 0);
+});
+
+test('N1 a listed destination field must be a plain string (arrays/objects cannot hide a URL)', async () => {
+  for (const cfg of [
+    { type: 'gotify', gotifyserverurl: ['http://192.168.1.54:8015'] }, { type: 'matrix', homeserverUrl: ['http://127.0.0.1'] },
+    { type: 'gorush', gorushServerURL: { a: 'http://127.0.0.1' } }, { type: 'smtp', smtpHost: ['127.0.0.1'], smtpPort: 25 },
+    { type: 'smtp', smtpHost: 'mail.example.com', smtpPort: [25] }, { type: 'nostr', relays: ['wss://203.0.113.9', 7] },
+  ]) await assert.rejects(assertNotificationConfigAllowed(cfg), /plain string/, JSON.stringify(cfg));
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'nostr', relays: ['wss://203.0.113.9', 'ws://127.0.0.1:8015'] }), /denylist/);
+});
+
+test('R1 apprise: one URL only; ,/; and second scheme:// refused; unknown schemes refused; token schemes literal-checked', async () => {
+  const a = (appriseURL: string, r?: any) => assertNotificationConfigAllowed({ type: 'apprise', appriseURL }, r);
+  await assert.rejects(a('json://203.0.113.9/,json://192.168.1.54:8015/'), /only one apprise URL/);
+  await assert.rejects(a('tgram://123abc/456;json://192.168.1.54:8015/'), /only one apprise URL/);
+  await assert.rejects(a('tgram://123abc/456 json://192.168.1.54:8015/'), /whitespace/);
+  await assert.rejects(a('ntfy://nas.nip.io:8015/t'), /not supported/);
+  await assert.rejects(a('apprise://localtest.me:8015/x'), /not supported/);
+  await assert.rejects(a('mailto://u:p@127.0.0.1'), /not supported/);
+  await assert.rejects(a('json://nx.example/', res({})), /could not be resolved/);
+  await a('tgram://123abc/456');
+  await a('discord://webhook-id/token');
+});
+
+test('R2 keep/pagertree destination keys; control and hidden characters in a destination are refused', async () => {
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'keep', webhookURL: 'http://127.0.0.1:8015/' }), /denylist/);
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'pagertree', pagertreeIntegrationUrl: 'http://127.0.0.1:8015/' }), /denylist/);
+  for (const v of ['\u0000http://192.168.1.54:8015/', '\u0001http://127.0.0.1:8015/x', ' http://127.0.0.1/', 'http://127.0.0.1​/', 'http://127.0.0.1 /', '﻿http://127.0.0.1/']) {
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', httpMethod: 'GET', webhookURL: v }), /control characters|whitespace|denylist/, JSON.stringify(v));
+  }
+  // an unlisted free-text field hiding a URL behind a control char is still seen as target-like
+  await assert.rejects(assertNotificationConfigAllowed({ type: 'pushover', note: '\u0000http://127.0.0.1:8015/' }), /not a known destination field/);
+  await assertNotificationConfigAllowed({ type: 'pushover', note: 'Disk space is low on the NAS' });
+});
+
+test('N2/N3 ntfy defaults work (ntfyAuthenticationMethod is not a method); known non-destination keys are skipped', async () => {
+  await assertNotificationConfigAllowed({ type: 'ntfy', ntfyserverurl: 'https://203.0.113.9/', ntfyAuthenticationMethod: 'usernamePassword', ntfyIcon: 'https://x.example/i.png', ntfytopic: 'alerts', ntfyPriority: 5 });
+  await assertNotificationConfigAllowed({ type: 'mattermost', mattermostWebhookUrl: 'https://203.0.113.9/h', mattermosticonurl: 'https://x.example/i.png' });
+  await assertNotificationConfigAllowed({ type: 'smtp', smtpHost: '203.0.113.9', smtpPort: 587, smtpDkimDomain: 'example.com' });
+  await assertNotificationConfigAllowed({ type: 'gorush', gorushServerURL: 'https://203.0.113.9/', gorushTopic: 'com.example.app' });
+});
+
+test('N4 heartbeat msg is withheld for monitor types that echo received data', async () => {
+  const { redactHeartbeatAck } = await import('../src/redact.js');
+  const rows = { ok: true, data: [{ status: 0, time: '2030-01-01 00:00:00', msg: 'Topic: t; Message: secret-payload-1' }] };
+  for (const t of ['mqtt', 'grpc-keyword', 'mysql', 'sqlserver', 'postgres', 'mongodb', 'redis', 'sip-options']) {
+    assert.ok(!JSON.stringify(redactHeartbeatAck(rows, t)).includes('secret-payload-1'), t);
+  }
+  assert.ok(JSON.stringify(redactHeartbeatAck({ ok: true, data: [{ status: 0, msg: 'timeout' }] }, 'http')).includes('timeout'));
+});
+
+test('N6 more forwarding/client-address headers refused', () => {
+  for (const n of ['X-Forwarded-Proto', 'X-Forwarded-Port', 'X-Forwarded-Prefix', 'X-Forwarded-Server', 'True-Client-IP', 'CF-Connecting-IP', 'X-Client-IP'])
+    assert.throws(() => buildAddPayload({ name: 'x', url: 'https://203.0.113.9/', headers: { [n]: 'v' } }), /not allowed/, n);
+});
+
+test('R4 maintenance: long cron windows, manual always, durationMinutes >= 1380, zod time bounds', async () => {
+  const mk = (o: any) => ({ monitorIds: [1], ...o });
+  assert.equal(maintenanceNeedsConfirm(mk({ strategy: 'cron', cron: '0 0 1 * *', durationMinutes: 44640 })), true);
+  assert.equal(maintenanceNeedsConfirm(mk({ strategy: 'cron', cron: '0 0 1 1 *', durationMinutes: 525600 })), true);
+  assert.equal(maintenanceNeedsConfirm(mk({ strategy: 'cron', cron: '0 3 * * *', durationMinutes: 1380 })), true);
+  assert.equal(maintenanceNeedsConfirm(mk({ strategy: 'cron', cron: '0 22 * * *', durationMinutes: 600 })), false);
+  assert.equal(maintenanceNeedsConfirm(mk({ strategy: 'cron', cron: '0 23 * * *', durationMinutes: 1000 })), false); // window began before the horizon start still counted, but 1000 min < 23h
+  assert.equal(maintenanceNeedsConfirm(mk({ strategy: 'manual', dateRange: [null, '2030-01-01 00:00:00'] })), true);
+  const am = tool('uptimekuma_add_maintenance');
+  for (const bad of [{ hours: 24, minutes: 0 }, { hours: 1, minutes: 60 }, { hours: -1, minutes: 0 }])
+    assert.equal(am.schema.safeParse({ title: 't', strategy: 'recurring-weekday', timeRange: [bad, { hours: 3, minutes: 0 }] }).success, false);
 });

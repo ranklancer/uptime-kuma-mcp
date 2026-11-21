@@ -220,11 +220,12 @@ test('F4 add_maintenance manual window needs confirmOpenEnded when large or with
   const c: any = (await import('../src/instances.js')).getClient('kuma');
   let added = 0;
   c.addMaintenance = async () => { added++; return { ok: true }; };
-  await am.handler(am.schema.parse({ ...base, monitorIds: [1], dateRange: [null, '2030-01-01 00:00:00'] }));
+  await assert.rejects(() => am.handler(am.schema.parse({ ...base, monitorIds: [1], dateRange: [null, '2030-01-01 00:00:00'] })), /confirmOpenEnded/); // R4: manual always needs confirm
   await am.handler(am.schema.parse({ ...base, monitorIds: [1, 2, 3, 4, 5, 6], confirmOpenEnded: true }));
+  await am.handler(am.schema.parse({ ...base, monitorIds: [1], confirmOpenEnded: true }));
   await assert.rejects(() => am.handler(am.schema.parse({ title: 'c', strategy: 'cron', cron: '0 3 * * *', monitorIds: [1, 2, 3, 4, 5, 6, 7] })), /confirmOpenEnded/); // M3: every strategy is gated
   await am.handler(am.schema.parse({ title: 'c', strategy: 'cron', cron: '0 3 * * *', monitorIds: [1, 2] })); // small, bounded: no confirm
-  assert.equal(added, 3);
+  assert.equal(added, 3); // confirmed manual x2 + small bounded cron
 });
 
 // ── Round 2: B1, N1-N5 ──────────────────────────────────────────────────────

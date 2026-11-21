@@ -408,7 +408,10 @@ export class UptimeKumaClient {
   async getHeartbeats(monitorId: number, periodHours = 24): Promise<any> {
     await this.ensureConnected();
     const res = await this.request('getMonitorBeats', monitorId, periodHours);
-    return redactHeartbeatAck(res);
+    // Some monitor types put data they received (MQTT payload, gRPC response, DB result) in msg: withhold it for those.
+    let type: string | undefined;
+    try { type = (await this.getMonitorRaw(monitorId))?.monitor?.type; } catch { type = 'unknown-fail-closed'; }
+    return redactHeartbeatAck(res, type === 'unknown-fail-closed' ? 'mqtt' : type);
   }
 
   /**
