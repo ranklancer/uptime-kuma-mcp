@@ -557,3 +557,24 @@ test('R7-c the server refuses to start with such an entry and says why', async (
   assert.equal(r.status, 1);
   assert.match(r.stderr, /KUMA_MCP_ALLOW_HOSTS.*\*\.co\.uk.*public suffix/i);
 });
+
+// ── review round 7 follow-ups (opus findings) ───────────────────────────────
+test('R7-d a hostname that WHATWG and legacy url.parse split differently is refused (name checked != host connected)', async () => {
+  await withEnv({ KUMA_MCP_NOTIFICATION_HOSTS: '*.lan.example', KUMA_MCP_ALLOW_HOSTS: '*.lan.example', KUMA_MCP_DENY_HOSTS: 'vaultwarden,192.168.1.54' }, async () => {
+    for (const u of ['https://vaultwarden;.lan.example', 'https://192.168.1.54%2a.lan.example', 'https://a{b}.lan.example', 'https://a|b.lan.example'])
+      await assert.rejects(assertNotificationConfigAllowed({ type: 'ntfy', ntfytopic: 't', ntfyserverurl: u }, res({})), /not allowed/, u);
+    for (const u of ['http://192.168.1.54;.lan.example:8015/', 'http://vaultwarden;.lan.example/'])
+      await assert.rejects(async () => { const t = { url: u }; assertTargetAllowed(t); await assertResolvedTargetAllowed(t, res({})); }, /not allowed/, u);
+    await assertNotificationConfigAllowed({ type: 'ntfy', ntfytopic: 't', ntfyserverurl: 'https://ntfy.lan.example' }, res({}));
+  });
+});
+
+test('R7-e multi-star, single-label and IP-embedding wildcards are rejected; private suffixes stay', async () => {
+  const { invalidAllowEntries } = await import('../src/policy.js');
+  const bad = ['**.com', '*.*.uk', '*.*', '*.xn--p1ai', '*.museum', '*.nip.io', '*.sslip.io', '*.192-168-1-54.nip.io'];
+  const good = ['*.lan', '*.local', '*.home.arpa', '*.internal', '*.lan.example', '*bifrost*', '*mcp*', '*.localhost', 'n8n', '192.168.1.0/24'];
+  await withEnv({ KUMA_MCP_ALLOW_HOSTS: [...bad, ...good].join(',') }, async () => {
+    for (const b of bad) assert.ok(invalidAllowEntries().includes(b), b);
+    for (const g of good) assert.ok(!invalidAllowEntries().includes(g), g);
+  });
+});

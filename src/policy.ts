@@ -72,13 +72,18 @@ function isAllowedHost(host: string, port: string): boolean {
 /** Entry grammar: host/glob[:port], IPv4 or IPv6 CIDR, bare IPv6, or [IPv6][:port]. */
 /** Single-label public suffixes a `*.` wildcard must not cover (every site under them). Homelab suffixes (.lan, .local, .home.arpa, .internal) stay allowed. */
 const PUBLIC_TLDS = new Set(['com', 'net', 'org', 'edu', 'gov', 'mil', 'int', 'info', 'biz', 'name', 'pro', 'io', 'dev', 'app', 'xyz', 'online', 'site', 'tech', 'cloud', 'me', 'tv', 'cc', 'co']);
+const PRIVATE_SUFFIXES = new Set(['lan', 'local', 'internal', 'localhost', 'test', 'example', 'corp', 'home', 'localdomain']);
 const CCSLD = /^(?:co|com|org|net|gov|edu|ac|or|ne|go|gob|mil|nom|ltd|plc|sch|gv|id|ind|nic)\.[a-z]{2}$/;
 
 /** Why a `*.suffix` host glob is too broad ("public suffix" / "numeric"), or null. Applies to any entry that starts with `*.`; a trailing `:port` is ignored. */
 export function wildcardProblem(entry: string): string | null {
-  const m = /^\*\.([a-z0-9_.-]+)(?::\d{1,5})?$/.exec(entry.toLowerCase());
+  const e = entry.toLowerCase();
+  if (/\*\*/.test(e) || /^\*\.[^:]*\*/.test(e)) return 'multi-star wildcard (matches far more than one domain)';
+  const m = /^\*\.([a-z0-9_.-]+)(?::\d{1,5})?$/.exec(e);
   if (!m) return null;
   const suffix = m[1];
+  if (/^[a-z0-9_-]+$/.test(suffix) && !PRIVATE_SUFFIXES.has(suffix)) return `single-label wildcard (covers every host under .${suffix}; only private suffixes such as .lan or .local are accepted)`;
+  if (/(^|\.)(nip\.io|sslip\.io|xip\.io)$/.test(suffix)) return 'wildcard over an IP-embedding DNS service (any private IP becomes an allowed name)';
   if (/^[0-9.]+$/.test(suffix)) return 'numeric wildcard (matches IP-address-shaped names, not a domain)';
   if (PUBLIC_TLDS.has(suffix) || CCSLD.test(suffix) || /^[a-z]{2}$/.test(suffix)) return `public suffix wildcard (covers every host under .${suffix})`;
   return null;
@@ -249,6 +254,9 @@ function parseTarget(raw: string): { host: string; port: string } | null {
     let port = u.port;
     if (!port && sch) port = DEFAULT_PORTS[sch[1].toLowerCase()] ?? '';
     if (!port && !sch) { const m = /:(\d+)(?:[/?#]|$)/.exec(s.replace(/^\[[^\]]*\]/, '')); if (m) port = m[1]; }
+    // WHATWG keeps characters such as `;` `%` `{` in a hostname that Node's legacy url.parse (used by older axios in Kuma)
+    // cuts off at, so the name checked here could differ from the host Kuma connects to. Anything but a plain DNS name or an IP literal is refused.
+    if (!/^[a-z0-9._-]+$/.test(host) && !(host.includes(':') && ipv6ToBig(host) !== null)) return null;
     return { host, port };
   } catch {
     return null;
@@ -590,7 +598,7 @@ export async function assertNotificationConfigAllowed(config: Record<string, unk
     // The check is on the RAW text: URL parsing would normalise `/.`, `/..` and `\x` into something that looks like a root.
     const v = typeof config.ntfyserverurl === 'string' ? config.ntfyserverurl.replace(/[\t\r\n]/g, '').trim() : '';
     if (v === '') throw new Error('notification config not allowed: ntfy needs ntfyserverurl set to the server root (an empty value makes Kuma pick a default)');
-    if (!/^[a-z][a-z0-9+.-]*:\/\/[^/\\?#]+\/?$/i.test(v)) throw new Error('notification config not allowed: ntfyserverurl must be the server root (no path, query or fragment)');
+    if (!/^[a-z][a-z0-9+.-]*:\/\/[a-z0-9._~:@\[\]-]+\/?$/i.test(v)) throw new Error('notification config not allowed: ntfyserverurl must be the server root (no path, query or fragment)');
   }
   const known = new Set<string>([...(spec.keys ?? []), ...(spec.multi ?? []), ...(spec.pair ?? []), ...(spec.skip ?? [])]);
   const notString = (k: string) => new Error(`notification config not allowed: "${k}" must be a plain string`);
