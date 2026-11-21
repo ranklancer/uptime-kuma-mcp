@@ -191,7 +191,7 @@ test('L2 failed add/delete/pause/resume/save errors do not echo Kuma msg', async
   client.ensureConnected = async () => {};
   client.emitWithAck = async () => ({ ok: false, msg: 'bad "X-Api-Key: ' + C + '" is not valid JSON' });
   for (const call of [() => client.addMonitor({ name: 'x' }), () => client.deleteMonitor(1), () => client.pauseMonitor(1),
-    () => client.resumeMonitor(1), () => client.saveNotification({ name: 'x' }), () => client.deleteNotification(1)]) {
+    () => client.resumeMonitor(1), () => client.saveNotification({ name: 'x', type: 'ntfy' }), () => client.deleteNotification(1)]) {
     await assert.rejects(call, (e: any) => { assert.ok(!e.message.includes(C)); assert.ok(e.message.includes(WITHHELD)); return true; });
   }
   client.emitWithAck = async () => ({ ok: false, msg: 'x ' + C, msgi18n: 'invalidJSON' });

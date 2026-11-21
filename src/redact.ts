@@ -264,8 +264,12 @@ export function sanitizeHeartbeatMsg(input: unknown): unknown {
   }
   // M1: a keyword monitor's failure text carries an excerpt of the response body after this marker
   // ("... but the keyword is not in [<first 50 chars>...]"): a yes/no oracle on an internal page. Drop it.
-  const kw = /(keyword is (?:not )?in\b)[\s\S]*$/i.exec(msg);
-  const safe = kw ? msg.slice(0, kw.index) + kw[1] + ' [response excerpt withheld]' : msg;
+  // json-query monitors do the same: "JSON query (does not) pass(es) (comparing <response value> <op> <expected>)".
+  let safe = msg;
+  const kw = /(keyword is (?:not |present )?in\b)[\s\S]*$/i.exec(safe);
+  if (kw) safe = safe.slice(0, kw.index) + kw[1] + ' [response excerpt withheld]';
+  const jq = /(\(comparing\s)[\s\S]*$/i.exec(safe);
+  if (jq) safe = safe.slice(0, jq.index) + jq[1] + '[response value withheld])';
   // Bounded scheme ({0,31}) keeps the scan linear; msg is capped first so row cost is bounded too.
   return safe.replace(/[a-z][a-z0-9+.-]{0,31}:\/\/[^\s"'<>]+/gi, (m) => String(scrubUrl(m)));
 }

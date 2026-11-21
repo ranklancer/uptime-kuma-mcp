@@ -25,6 +25,7 @@
  */
 
 import { lookup } from 'node:dns/promises';
+import { domainToASCII } from 'node:url';
 
 export const SAFE_METHODS = ['GET', 'HEAD'] as const;
 export const WRITE_METHODS = ['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'] as const;
@@ -294,7 +295,8 @@ function portOk(want: string | null, port: string): boolean {
  * and let a port embedded in the name override the port field.
  */
 function assertBareHost(raw: string): void {
-  const s = raw.trim();
+  let s = raw.trim();
+  if (/[^\x00-\x7f]/.test(s)) s = domainToASCII(s); // IDN: validate the punycode form ('' = invalid)
   const ok = /^[a-z0-9_.-]+$/i.test(s) || (s.includes(':') && /^\[?[0-9a-f:.]+\]?$/i.test(s) && ipv6ToBig(s.replace(/^\[|\]$/g, '')) !== null);
   if (!ok) throw new Error('monitor target not allowed: hostname must be a bare host name or IP address (no scheme, credentials, port or path)');
 }
@@ -368,26 +370,91 @@ export async function assertResolvedTargetAllowed(
   }
 }
 
-/** Notification config keys whose values name a network destination (H1). */
-const NOTIF_TARGET_KEY = /url|uri|endpoint|host|server/i;
+
+// ── Notification provider config (H1) ───────────────────────────────────────
+
+/** Destination spec for a provider type: single/multi-value fields holding a URL or host, and host+port field pairs. */
+interface NotifDest { keys?: string[]; multi?: string[]; pair?: [string, string] }
+
+/**
+ * Per-provider-type table of fields that name a network destination. A type that is not listed is REFUSED
+ * (fail closed). A field not listed for its type whose value looks like a URL/host is refused too, so a new or
+ * unexpected destination field cannot be used to smuggle a target. Keys are Kuma's provider type ids, lower-cased.
+ */
+const NOTIF_TYPES: Record<string, NotifDest> = {
+  webhook: { keys: ['webhookURL'] }, ntfy: { keys: ['ntfyserverurl'] }, gotify: { keys: ['gotifyserverurl'] },
+  slack: { keys: ['slackwebhookURL'] }, discord: { keys: ['discordWebhookUrl'] }, teams: { keys: ['webhookUrl'] },
+  telegram: { keys: ['telegramServerUrl'] }, smtp: { pair: ['smtpHost', 'smtpPort'] }, apprise: { keys: ['appriseURL'] },
+  matrix: { keys: ['homeserverUrl'] }, mattermost: { keys: ['mattermostWebhookUrl'] }, 'rocket.chat': { keys: ['rocketwebhookURL'] },
+  gorush: { keys: ['gorushServerURL'] }, homeassistant: { keys: ['homeAssistantUrl'] }, signal: { keys: ['signalURL'] },
+  googlechat: { keys: ['googleChatWebhookURL'] }, nostr: { multi: ['relays', 'nostrRelays'] },
+  onebot: { keys: ['httpAddr'] }, milky: { keys: ['httpAddr'] }, pushdeer: { keys: ['pushdeerServer'] },
+  feishu: { keys: ['feishuWebHookUrl'] }, dingding: { keys: ['webHookUrl'] }, bark: { keys: ['barkEndpoint'] },
+  pagerduty: { keys: ['pagerdutyIntegrationUrl'] }, alerta: { keys: ['alertaApiEndpoint'] }, splunk: { keys: ['splunkRestURL'] },
+  stackfield: { keys: ['stackfieldwebhookURL'] }, zohocliq: { keys: ['webhookUrl'] }, smseagle: { keys: ['smseagleUrl'] },
+  grafanaoncall: { keys: ['GrafanaOncallURL'] }, evolution: { keys: ['evolutionApiUrl'] }, wecom: {},
+  serverchan: {}, // serverChanSendKey is a key, not a host
+  pushover: {}, pushbullet: {}, line: {}, linenotify: {}, lunasea: {}, octopush: {}, opsgenie: {}, pagertree: {}, pushbytechulus: {},
+  pushy: {}, threema: {}, twilio: {}, clicksendsms: {}, keep: {},
+};
+const NOTIF_RESERVED = new Set(['name', 'type', 'isDefault', 'applyExisting', 'active', 'id', 'userId']);
 /** Webhook free-form request shaping: refused unless the operator allows write-style requests. */
 const NOTIF_REQUEST_SHAPING_KEYS = ['webhookCustomBody', 'webhookAdditionalHeaders'];
+/** apprise schemes that are HTTP requests under the hood: checked exactly like http(s). */
+const APPRISE_HTTP_SCHEMES: Record<string, string> = { json: 'http', jsons: 'https', xml: 'http', xmls: 'https', form: 'http', forms: 'https' };
 
-function notificationTargets(v: unknown, key: string, out: string[], depth = 0): void {
+/** True if a string value reads as a URL, host, host:port or IP literal (so an unlisted key carrying it is suspect). */
+function looksTargetLike(v: string): boolean {
+  const s = v.replace(/[\t\r\n]/g, '').trim();
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) return true;
+  if (/^\[?[0-9a-f]*:[0-9a-f:.]*:[0-9a-f:.]*\]?(:\d+)?([/?#].*)?$/i.test(s) && (s.match(/:/g) ?? []).length >= 2) return true; // IPv6
+  if (/^[a-z0-9_-]+(\.[a-z0-9_-]+)+\.?(:\d{1,5})?([/?#].*)?$/i.test(s) && !/^\d+(\.\d+)?$/.test(s)) return true; // dotted name / IPv4
+  const hp = /^([a-z0-9_.-]+):\d{1,5}([/?#].*)?$/i.exec(s);
+  return !!hp && !/^\d+$/.test(hp[1]);
+}
+
+function* stringLeaves(v: unknown, depth = 0): Generator<string> {
   if (depth > 6 || v === null || v === undefined) return;
-  if (typeof v === 'string') { if (NOTIF_TARGET_KEY.test(key) && v.trim() !== '') out.push(v.trim()); return; }
-  if (Array.isArray(v)) { for (const x of v) notificationTargets(x, key, out, depth + 1); return; }
-  if (typeof v === 'object') for (const [k, x] of Object.entries(v as Record<string, unknown>)) notificationTargets(x, NOTIF_TARGET_KEY.test(key) ? key : k, out, depth + 1);
+  if (typeof v === 'string') yield v;
+  else if (Array.isArray(v)) for (const x of v) yield* stringLeaves(x, depth + 1);
+  else if (typeof v === 'object') for (const x of Object.values(v as Record<string, unknown>)) yield* stringLeaves(x, depth + 1);
+}
+
+async function checkNotificationDestination(raw: string, resolve: Resolver | undefined, multi: boolean): Promise<void> {
+  // The URL parser (axios) deletes tab/CR/LF anywhere in a URL and %-encodes other whitespace: a space or
+  // line break can hide a different host, so only newline-separated multi-value fields keep their separators.
+  const s = (multi ? raw.replace(/\t/g, '') : raw.replace(/[\t\r\n]/g, '')).trim();
+  if (s === '') return;
+  if (/\s/.test(s)) throw new Error('notification config not allowed: destination contains whitespace');
+  const sch = /^([a-z][a-z0-9+.-]*):\/\//i.exec(s);
+  const scheme = sch ? sch[1].toLowerCase() : '';
+  let url: string | null = null;
+  if (ALLOWED_SCHEMES.includes(scheme)) url = s;
+  else if (APPRISE_HTTP_SCHEMES[scheme]) url = APPRISE_HTTP_SCHEMES[scheme] + s.slice(scheme.length);
+  else if (!sch) url = /[/?#@]/.test(s) ? 'http://' + s : null;
+  if (url !== null) {
+    assertTargetAllowed({ url });
+    await assertResolvedTargetAllowed({ url }, resolve);
+    return;
+  }
+  if (!sch) { assertTargetAllowed({ hostPort: s }); await assertResolvedTargetAllowed({ hostPort: s }, resolve); return; }
+  // Other apprise schemes (tgram://, mailto://, ...): the "host" is often a token, so only the literal denylist applies.
+  let u: URL;
+  try { u = new URL(s); } catch { throw new Error('notification config not allowed: unparseable URL'); }
+  if (u.host) assertTargetAllowed({ hostPort: u.host }); // u.host keeps IPv6 brackets and the port
 }
 
 /**
- * Policy for notification provider config supplied by the caller (create/update): every URL/host-shaped value
- * must pass the target denylist and the resolve-time check, and a webhook may not carry a custom body or
- * additional headers (agent-controlled content POSTed on every status change = exfiltration channel)
- * unless the operator set KUMA_MCP_ALLOW_WRITE_METHODS=1. Non-http(s) URL schemes (apprise: json://, tgram://)
- * get the literal denylist check only: their "host" is often a token, so it cannot be resolved.
+ * Policy for the full effective notification config (create: the caller's object; update: stored config merged
+ * with the changes). The provider type must be on the table; every destination field of that type passes the
+ * target denylist and the resolve-time check (host+port jointly, multi-value fields split); no unlisted field may
+ * carry a URL/host-like value; a webhook custom body, additional headers or a non-GET/HEAD method needs
+ * KUMA_MCP_ALLOW_WRITE_METHODS=1 (agent-chosen content POSTed on every status change is an exfiltration channel).
  */
 export async function assertNotificationConfigAllowed(config: Record<string, unknown>, resolve?: Resolver): Promise<void> {
+  const type = String(config.type ?? '').toLowerCase();
+  const spec = NOTIF_TYPES[type];
+  if (!spec) throw new Error(`notification config not allowed: provider type "${type.slice(0, 40)}" is not on the supported list`);
   if (!allowWriteMethods()) {
     for (const k of NOTIF_REQUEST_SHAPING_KEYS) {
       const v = config[k];
@@ -395,22 +462,35 @@ export async function assertNotificationConfigAllowed(config: Record<string, unk
         throw new Error('notification config not allowed: a custom webhook body or additional headers needs KUMA_MCP_ALLOW_WRITE_METHODS=1 on the MCP server');
       }
     }
-  }
-  const targets: string[] = [];
-  for (const [k, v] of Object.entries(config)) notificationTargets(v, k, targets);
-  for (const raw of targets) {
-    const sch = /^([a-z][a-z0-9+.-]*):\/\//i.exec(raw);
-    if (sch && !ALLOWED_SCHEMES.includes(sch[1].toLowerCase())) {
-      let u: URL;
-      try { u = new URL(raw); } catch { throw new Error('notification config not allowed: unparseable URL'); }
-      const host = u.hostname.replace(/^\[|\]$/g, '');
-      if (host) assertTargetAllowed({ hostPort: host + (u.port ? ':' + u.port : '') });
-      continue;
+    for (const [k, v] of Object.entries(config)) {
+      if (/method$/i.test(k) && typeof v === 'string' && v !== '' && !(SAFE_METHODS as readonly string[]).includes(v.trim().toUpperCase())) {
+        throw new Error('notification config not allowed: only GET/HEAD requests unless KUMA_MCP_ALLOW_WRITE_METHODS=1');
+      }
     }
-    if (/\s/.test(raw)) continue; // free text, not a destination
-    if (sch) { assertTargetAllowed({ url: raw }); await assertResolvedTargetAllowed({ url: raw }, resolve); continue; }
-    const hp = raw.includes('/') || raw.includes('@') ? { url: 'http://' + raw } : { hostPort: raw };
-    assertTargetAllowed(hp);
-    await assertResolvedTargetAllowed(hp, resolve);
+  }
+  const known = new Set<string>([...(spec.keys ?? []), ...(spec.multi ?? []), ...(spec.pair ?? [])]);
+  for (const k of spec.keys ?? []) {
+    const v = config[k];
+    if (typeof v === 'string') await checkNotificationDestination(v, resolve, false);
+  }
+  for (const k of spec.multi ?? []) {
+    const v = config[k];
+    const parts = Array.isArray(v) ? v.map(String) : typeof v === 'string' ? v.split(/[\r\n,]+/) : [];
+    for (const part of parts) await checkNotificationDestination(part, resolve, true);
+  }
+  if (spec.pair) {
+    const host = config[spec.pair[0]], rawPort = config[spec.pair[1]];
+    if (typeof host === 'string' && host.trim() !== '') {
+      const port = rawPort === undefined || rawPort === null || rawPort === '' ? undefined : Number(rawPort);
+      if (port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new Error('notification config not allowed: invalid port');
+      assertTargetAllowed({ hostname: host, port }); // host and port are judged together (host:port deny entries)
+      await assertResolvedTargetAllowed({ hostname: host, port }, resolve);
+    }
+  }
+  for (const [k, v] of Object.entries(config)) {
+    if (known.has(k) || NOTIF_RESERVED.has(k) || NOTIF_REQUEST_SHAPING_KEYS.includes(k)) continue;
+    for (const leaf of stringLeaves(v)) {
+      if (looksTargetLike(leaf)) throw new Error(`notification config not allowed: field "${k}" holds a URL/host but is not a known destination field for provider type "${type}"`);
+    }
   }
 }

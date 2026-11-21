@@ -141,20 +141,41 @@ const TYPE_ONLY_FIELDS: Array<{ types: string[]; reset: Record<string, unknown> 
 ];
 
 /** Headers that steer virtual-host routing or method/URL rewriting behind a reverse proxy: refused (M2). */
-const FORBIDDEN_HEADERS = ['host', 'x-forwarded-host', 'x-original-url', 'x-rewrite-url', 'x-http-method-override'];
+const FORBIDDEN_HEADERS = ['host', 'x-forwarded-host', 'x-original-url', 'x-rewrite-url', 'x-http-method-override',
+  'x-forwarded-for', 'x-real-ip', 'forwarded', 'x-original-host'];
+
+function refuseHeader(name: unknown): void {
+  const n = String(name).replace(/\s/g, '').toLowerCase();
+  if (FORBIDDEN_HEADERS.includes(n)) {
+    throw new Error(`header "${String(name).trim()}" is not allowed (it can redirect the request to another virtual host, rewrite its method/URL or spoof the client address)`);
+  }
+}
+
+/** Header names in any shape: {Name: v}, [{name|key: 'Name', value}], ['Name: v'], nested objects. */
+function scanHeaders(h: unknown, depth = 0): void {
+  if (depth > 5 || h === null || typeof h !== 'object') return;
+  if (Array.isArray(h)) {
+    for (const x of h) {
+      if (typeof x === 'string') refuseHeader(x.split(':')[0]);
+      else scanHeaders(x, depth + 1);
+    }
+    return;
+  }
+  const o = h as Record<string, unknown>;
+  for (const k of Object.keys(o)) { refuseHeader(k); scanHeaders(o[k], depth + 1); }
+  for (const k of ['name', 'key', 'header']) if (typeof o[k] === 'string') refuseHeader(o[k]);
+}
 
 function assertHeadersAllowed(headers: unknown): void {
   let h: unknown = headers;
-  if (typeof h === 'string') {
-    if (h.trim() === '') return;
-    try { h = JSON.parse(h); } catch { return; } // Kuma rejects non-JSON headers itself
-  }
-  if (!h || typeof h !== 'object') return;
-  for (const k of Object.keys(h)) {
-    if (FORBIDDEN_HEADERS.includes(k.trim().toLowerCase())) {
-      throw new Error(`header "${k.trim()}" is not allowed (it can redirect the request to another virtual host or rewrite its method/URL)`);
+  if (typeof headers === 'string') {
+    if (headers.trim() === '') return;
+    try { h = JSON.parse(headers); } catch {
+      for (const line of headers.split(/[\r\n]+/)) refuseHeader(line.split(':')[0]); // Kuma rejects non-JSON headers itself; refuse obvious raw lines too
+      return;
     }
   }
+  scanHeaders(h);
 }
 
 /** Keys a caller can never set: the token is server-generated, active/ownership are not tool-controlled. */

@@ -594,16 +594,19 @@ export class UptimeKumaClient {
     else if (typeof rawConfig === 'string') {
       try { currentConfig = JSON.parse(rawConfig); } catch { currentConfig = {}; }
     }
+    // config first: the explicit top-level fields (which the tool layer gates) must win over anything inside `config`.
     const changes: Record<string, unknown> = {
+      ...(args.config ?? {}),
       ...(args.name !== undefined ? { name: args.name } : {}),
       ...(args.type !== undefined ? { type: args.type } : {}),
       ...(args.isDefault !== undefined ? { isDefault: args.isDefault } : {}),
       ...(args.applyExisting !== undefined ? { applyExisting: args.applyExisting } : {}),
-      ...(args.config ?? {}),
     };
     assertNotificationEditAllowed(currentConfig, changes);
-    await assertNotificationConfigAllowed(changes);
     const merged: Record<string, any> = { ...currentConfig, ...changes };
+    if (merged.type === undefined) merged.type = (existing as any).type;
+    // The EFFECTIVE config is policed (stored fields included), not only the incoming changes.
+    await assertNotificationConfigAllowed(merged);
     // Kuma requires name and type to be present on save.
     if (merged.name === undefined) merged.name = (existing as any).name;
     return this.saveNotification(merged, notificationId);

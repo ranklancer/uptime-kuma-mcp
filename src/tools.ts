@@ -96,9 +96,65 @@ export function assertNotificationApplyConfirmed(a: { isDefault?: boolean; apply
   }
 }
 
-/** A maintenance window silences alerts: confirm when it covers more than 5 monitors, runs all day, or has no end (any strategy). */
+/** isDefault / applyExisting inside `config` would bypass the confirmApply gate on the top-level fields. */
+export function assertNoReservedConfigKeys(config: Record<string, unknown> | undefined): void {
+  for (const k of ['isDefault', 'applyExisting', 'name', 'type', 'active', 'id', 'userId']) {
+    if (config && k in config) throw new Error(`"${k}" must be passed as a top-level parameter, not inside config`);
+  }
+}
+
+/** Longest contiguous silence (minutes) that counts as "all day": 23h. Gaps of up to 5 minutes between windows are treated as continuous. */
+const LONG_SILENCE_MIN = 23 * 60;
+const MERGE_GAP_MIN = 5;
+
+/** Expand one cron field (*, n, a-b, *\/n, a-b/n, comma lists) to a set, or null when it cannot be read. */
+function cronField(f: string, lo: number, hi: number): Set<number> | null {
+  const out = new Set<number>();
+  for (const part of f.split(',')) {
+    const m = /^(\*|\d+(?:-\d+)?)(?:\/(\d+))?$/.exec(part);
+    if (!m) return null;
+    const step = m[2] ? Number(m[2]) : 1;
+    if (step < 1) return null;
+    let a = lo, b = hi;
+    if (m[1] !== '*') { const [x, y] = m[1].split('-').map(Number); a = x; b = y ?? (m[2] ? hi : x); }
+    if (a < lo || b > hi || a > b) return null;
+    for (let v = a; v <= b; v += step) out.add(v);
+  }
+  return out;
+}
+
+/** True if a cron window of `duration` minutes can silence alerts continuously for 23h+ (simulated over 8 days from a fixed Monday). Unreadable cron: true (fail closed). */
+function cronSilencesLong(expr: string, duration: number): boolean {
+  const f = expr.trim().split(/\s+/);
+  if (f.length !== 5) return true;
+  const [mi, h, dom, mon, dow] = [cronField(f[0], 0, 59), cronField(f[1], 0, 23), cronField(f[2], 1, 31), cronField(f[3], 1, 12), cronField(f[4].replace(/7/g, '0'), 0, 6)];
+  if (!mi || !h || !dom || !mon || !dow) return true;
+  const start = Date.UTC(2030, 0, 7); // a Monday
+  const wins: Array<[number, number]> = [];
+  for (let t = 0; t < 8 * 1440; t++) {
+    const d = new Date(start + t * 60000);
+    if (!mi.has(d.getUTCMinutes()) || !h.has(d.getUTCHours()) || !mon.has(d.getUTCMonth() + 1)) continue;
+    const domOk = dom.has(d.getUTCDate()), dowOk = dow.has(d.getUTCDay());
+    const domStar = f[2] === '*', dowStar = f[4] === '*';
+    if (!(domStar || dowStar ? domOk && dowOk : domOk || dowOk)) continue; // cron: dom OR dow when both restricted
+    wins.push([t, t + duration]);
+  }
+  let cur: [number, number] | null = null;
+  for (const w of wins) {
+    if (cur && w[0] <= cur[1] + MERGE_GAP_MIN) cur[1] = Math.max(cur[1], w[1]);
+    else { if (cur && cur[1] - cur[0] >= LONG_SILENCE_MIN) return true; cur = [w[0], w[1]]; }
+  }
+  return !!cur && cur[1] - cur[0] >= LONG_SILENCE_MIN;
+}
+
+/**
+ * A maintenance window silences alerts: confirm when it covers more than 5 monitors, can silence alerts
+ * continuously for 23h or more (computed from the effective schedule for every strategy, e.g. a cron that
+ * fires every 30 minutes with a 60 minute duration), or has no end. A typo guard, not an agent-proof control.
+ */
 export function maintenanceNeedsConfirm(a: {
-  strategy: string; monitorIds: readonly number[]; dateRange?: readonly (string | null)[]; timeRange?: readonly { hours: number; minutes: number }[]; durationMinutes?: number;
+  strategy: string; monitorIds: readonly number[]; dateRange?: readonly (string | null)[]; timeRange?: readonly { hours: number; minutes: number }[];
+  durationMinutes?: number; cron?: string;
 }): boolean {
   if (a.monitorIds.length > 5) return true;
   const DAY_MS = 24 * 3600 * 1000;
@@ -110,12 +166,12 @@ export function maintenanceNeedsConfirm(a: {
       const span = s ? Date.parse(e.replace(' ', 'T')) - Date.parse(s.replace(' ', 'T')) : Infinity;
       return !(span < DAY_MS); // NaN (unparseable) also needs confirm
     }
-    case 'cron': return (a.durationMinutes ?? 60) >= 1440;
+    case 'cron': return a.cron ? cronSilencesLong(a.cron, a.durationMinutes ?? 60) : true;
     default: {
-      if (!a.timeRange) return false;
+      if (!a.timeRange) return false; // the handler substitutes the 02:00-03:00 default
       const [s, e] = a.timeRange;
-      const span = (((e.hours * 60 + e.minutes) - (s.hours * 60 + s.minutes)) + 1440) % 1440;
-      return span === 0 || span >= 1439;
+      const span = (((e.hours * 60 + e.minutes) - (s.hours * 60 + s.minutes)) + 1440) % 1440 || 1440;
+      return span >= LONG_SILENCE_MIN;
     }
   }
 }
@@ -365,12 +421,13 @@ export const toolDefs: ToolDef[] = [
     }),
     handler: async (args) => {
       assertNotificationApplyConfirmed(args);
+      assertNoReservedConfigKeys(args.config);
       const notification = {
+        ...(args.config ?? {}),
         name: args.name,
         type: args.type,
         isDefault: args.isDefault ?? false,
         applyExisting: args.applyExisting ?? false,
-        ...(args.config ?? {}),
       };
       return getClient(args.instance).saveNotification(notification, null);
     },
@@ -392,6 +449,7 @@ export const toolDefs: ToolDef[] = [
     }),
     handler: async (args) => {
       assertNotificationApplyConfirmed(args);
+      assertNoReservedConfigKeys(args.config);
       return getClient(args.instance).updateNotification(args.notificationId, args);
     },
   },
