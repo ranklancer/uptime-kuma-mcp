@@ -249,6 +249,9 @@ function parseTarget(raw: string): { host: string; port: string } | null {
     // while Node's legacy url.parse stops at the `%`, so the host checked would not be the host Kuma connects to.
     const rawAuth = (sch ? s : 'http://' + s).replace(/[\t\r\n]/g, '').replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split(/[/\\?#]/)[0].replace(/^.*@/, '');
     if (!/^(?:[a-z0-9._\u0080-\uffff-]+|\[[0-9a-f:.]+\])(?::\d{0,5})?$/i.test(rawAuth)) return null;
+    // Numeric hosts must be plain dotted-decimal: 0x7f.1, 2130706433 and 192.168.1.054 are read differently by different resolvers/OSes.
+    const rawHost = rawAuth.replace(/:\d*$/, '');
+    if (/^[0-9x.]+$/i.test(rawHost) && !/^(?:(?:0|[1-9]\d{0,2})\.){3}(?:0|[1-9]\d{0,2})$/.test(rawHost)) return null;
     const u = new URL(sch ? s : 'http://' + s);
     // Collapse any run of trailing dots (localhost.. resolves like localhost).
     let host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
@@ -538,6 +541,7 @@ async function checkNotificationDestination(raw: string, resolve: Resolver | und
   if (/\t/.test(s) || (!opts.multi && /[\r\n]/.test(s))) throw new Error('notification config not allowed: destination contains whitespace or control characters');
   if (/\s/.test(s) || HIDDEN_TEST.test(s)) throw new Error('notification config not allowed: destination contains whitespace or control characters');
   if (opts.apprise) {
+    if (s.includes('\\')) throw new Error('notification config not allowed: backslash in an apprise URL');
     // apprise splits one value into several URLs on whitespace, commas and semicolons: only a single URL is accepted.
     if (/[,;]/.test(s) || (s.match(/[a-z][a-z0-9+.-]*:\/\//gi) ?? []).length > 1) throw new Error('notification config not allowed: only one apprise URL is accepted');
     const m = /^([a-z][a-z0-9+.-]*):\/\//i.exec(s);
@@ -557,8 +561,12 @@ async function checkNotificationDestination(raw: string, resolve: Resolver | und
   }
   const sch = /^([a-z][a-z0-9+.-]*):\/\//i.exec(s);
   if (sch && !ALLOWED_SCHEMES.includes(sch[1].toLowerCase())) throw new Error('notification config not allowed: destination scheme must be http, https, ws or wss');
-  if (sch || /[/?#@]/.test(s)) {
-    const url = sch ? s : 'http://' + s;
+  if (!sch && /[/?#@\\]/.test(s)) {
+    // Without a scheme Kuma's HTTP client sends the request to localhost:80 (path = the whole value), not to the host written here.
+    throw new Error('notification config not allowed: a URL destination must start with http://, https://, ws:// or wss://');
+  }
+  if (sch) {
+    const url = s;
     assertTargetAllowed({ url });
     assertNotificationHostListed(url);
     await assertResolvedTargetAllowed({ url }, resolve);

@@ -631,3 +631,28 @@ test('R9-N ntfyserverurl userinfo is refused; very short globs (*e*, a*) are inv
     for (const g of ['*mcp*', '*bifrost*', '*.lan']) assert.ok(!invalidAllowEntries().includes(g), g);
   });
 });
+
+// ── review round 10 ─────────────────────────────────────────────────────────
+test('R10-S1 a scheme-less URL destination is refused (Kuma would send it to localhost:80)', async () => {
+  await withEnv({ KUMA_MCP_NOTIFICATION_TYPES: 'webhook,gotify', KUMA_MCP_NOTIFICATION_HOSTS: 'hooks.rebhahnomicon.com,hooks.rebhahnomicon.com:8080', KUMA_MCP_ALLOW_HOSTS: '*.rebhahnomicon.com' }, async () => {
+    for (const v of ['hooks.rebhahnomicon.com/x', 'evil@hooks.rebhahnomicon.com', 'hooks.rebhahnomicon.com?x', 'hooks.rebhahnomicon.com:8080/x', 'hooks.rebhahnomicon.com\\x'])
+      await assert.rejects(assertNotificationConfigAllowed({ type: 'webhook', httpMethod: 'GET', webhookURL: v }, res({})), /scheme|not allowed/, v);
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'gotify', gotifyserverurl: 'hooks.rebhahnomicon.com#' }, res({})), /scheme|not allowed/);
+    await assertNotificationConfigAllowed({ type: 'webhook', httpMethod: 'GET', webhookURL: 'https://hooks.rebhahnomicon.com/x' }, res({}));
+  });
+});
+
+test('R10-N1 non-canonical IPv4 spellings are refused in hosts (resolvers disagree on octal/hex/decimal)', async () => {
+  await withEnv({ KUMA_MCP_DENY_HOSTS: '192.168.1.54:8015' }, async () => {
+    for (const u of ['http://192.168.1.054:8015/', 'http://0xc0.0xa8.1.54:8015/', 'http://3232235830:8015/', 'http://192.168.1.54.:8015/x'.replace('54.', '054')])
+      assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, u);
+    assertTargetAllowed({ url: 'http://192.168.1.55:8015/' });
+  });
+});
+
+test('R10-N3/N4 backslash in an apprise URL refused; post-parse hostname charset still guards fullwidth characters', async () => {
+  await withEnv({ KUMA_MCP_NOTIFICATION_TYPES: 'apprise', KUMA_MCP_NOTIFICATION_HOSTS: 'ntfy.rebhahnomicon.com:443', KUMA_MCP_ALLOW_HOSTS: '*.rebhahnomicon.com' }, async () => {
+    await assert.rejects(assertNotificationConfigAllowed({ type: 'apprise', appriseURL: 'jsons://ntfy.rebhahnomicon.com:443\\@192.168.1.54:8015/' }, res({})), /backslash|not allowed/);
+  });
+  for (const u of ['http://n8n＊/', 'http://a＄b/']) assert.throws(() => assertTargetAllowed({ url: u }), /not allowed/, u);
+});
