@@ -170,7 +170,7 @@ export function denyList(exemptPrivate = false): string[] {
 
 /** `https://` is the Kuma UI's placeholder url for non-HTTP monitors; it is not a target. */
 export function isPlaceholderUrl(u: unknown): boolean {
-  return typeof u !== 'string' || u.trim() === '' || u.trim() === 'https://';
+  return typeof u !== 'string' || u === '' || u === 'https://'; // exact match only: a padded placeholder is not one (legacy url.parse would connect it to localhost)
 }
 
 /** Port the Kuma UI fills in when the monitor type has a conventional one and none was given. */
@@ -205,6 +205,8 @@ export function effectiveTarget(m: Record<string, any>): Target {
   if (t === 'grpc') return { hostPort: typeof m.grpcUrl === 'string' && m.grpcUrl.trim() ? m.grpcUrl.trim() : undefined };
   if (DB_TYPES.includes(t)) return { hostPort: dbTargetOf(m.databaseConnectionString) };
   const unknown = !URL_TYPES.includes(t) && !HOST_TYPES.includes(t);
+  // An http-type monitor with no real url would be sent by Kuma to localhost: that is a target, and it is refused.
+  if (URL_TYPES.includes(t) && isPlaceholderUrl(m.url)) throw new Error('monitor target not allowed: this monitor type needs an explicit http(s):// url');
   return {
     url: (URL_TYPES.includes(t) || unknown) && !isPlaceholderUrl(m.url) ? m.url : undefined,
     hostname: HOST_TYPES.includes(t) || unknown ? m.hostname : undefined,

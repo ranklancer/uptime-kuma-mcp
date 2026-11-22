@@ -6,7 +6,7 @@ process.env.KUMA_USERNAME ??= 'u';
 process.env.KUMA_PASSWORD ??= 'p';
 process.env.KUMA_MCP_NOTIFICATION_HOSTS = '203.0.113.9,203.0.113.9:80,203.0.113.9:25,203.0.113.9:587,ok.example,evil.example,nx.example,x.example,other.example,*.example.com,ntfy.test,n.test,h.test,rebind.example:8015,192.168.1.54:587'; // tests of the host list itself override this
 process.env.KUMA_MCP_NOTIFICATION_TYPES = 'ntfy,webhook,smtp,apprise,onebot,milky,nostr,pushover,serverchan,telegram,gotify,matrix,gorush,keep,pagertree,mattermost,brandnew,twilio';
-const { assertTargetAllowed, assertResolvedTargetAllowed, assertNotificationConfigAllowed, denyList, invalidNotificationHostEntries } = await import('../src/policy.js');
+const { assertTargetAllowed, assertResolvedTargetAllowed, assertNotificationConfigAllowed, denyList, invalidNotificationHostEntries, effectiveTarget } = await import('../src/policy.js');
 const { buildAddPayload, buildEditPayload } = await import('../src/payload.js');
 const { sanitizeHeartbeatMsg } = await import('../src/redact.js');
 const { toolDefs, maintenanceNeedsConfirm } = await import('../src/tools.js');
@@ -721,4 +721,14 @@ test('R14-A1 a monitor target padded with Unicode whitespace is refused (JS trim
     assert.throws(() => assertTargetAllowed({ url: u }), /whitespace|not allowed/, JSON.stringify(u));
   assert.throws(() => assertTargetAllowed({ hostname: ' a.example' }), /not allowed|whitespace/);
   assertTargetAllowed({ url: 'https://a.example/' });
+});
+
+test('R14-B1 an http-type monitor without a real url (empty/placeholder/padded) is refused: Kuma would send it to localhost', () => {
+  assert.throws(() => buildAddPayload({ type: 'http', name: 'x' }), /explicit http/);
+  for (const u of ['', ' ', ' ', '﻿', ' https://', 'https:// '])
+    assert.throws(() => buildAddPayload({ type: 'http', name: 'x', url: u }), /not allowed/, JSON.stringify(u));
+  assert.throws(() => effectiveTarget({ type: 'keyword', url: 'https://' }), /explicit http/);
+  assert.throws(() => effectiveTarget({ type: 'http', url: undefined }), /explicit http/);
+  buildAddPayload({ type: 'ping', name: 'x', hostname: 'a.example' });
+  buildAddPayload({ type: 'http', name: 'x', url: 'https://a.example/' });
 });

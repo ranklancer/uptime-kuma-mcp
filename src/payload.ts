@@ -221,6 +221,7 @@ export function buildAddPayload(rawOpts: Record<string, any>): Record<string, an
   });
   const m = monitorDefaults();
   applyChanges(m, opts);
+  assertTargetAllowed(effectiveTarget(m)); // the merged monitor: an http-type add without a url must not reach Kuma as the placeholder
   if ((m.port === undefined || m.port === null) && UI_DEFAULT_PORTS[m.type]) m.port = UI_DEFAULT_PORTS[m.type]; // as the UI does
   // H2: a followed redirect is a second, unchecked target: forced to 0 (operator may allow a cap of 2), with or without write methods.
   m.maxredirects = Math.min(opts.maxredirects === undefined ? 0 : Number(opts.maxredirects) || 0, maxRedirectsCap());

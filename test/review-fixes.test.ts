@@ -31,18 +31,18 @@ test('F1 schema: method is GET/HEAD only by default', () => {
 });
 
 test('F1 payload builders refuse write methods and any body unless the operator opts in', () => {
-  assert.throws(() => buildAddPayload({ name: 'x', method: 'POST' }), /method not allowed/);
-  assert.throws(() => buildAddPayload({ name: 'x', body: { a: 1 } }), /body not allowed/);
+  assert.throws(() => buildAddPayload({ url: 'https://a.test/', name: 'x', method: 'POST' }), /method not allowed/);
+  assert.throws(() => buildAddPayload({ url: 'https://a.test/', name: 'x', body: { a: 1 } }), /body not allowed/);
   assert.throws(() => buildEditPayload(cur, { method: 'POST' }, 5), /method not allowed/);
   assert.throws(() => buildEditPayload(cur, { body: 'x' }, 5), /body not allowed/);
-  assert.doesNotThrow(() => buildAddPayload({ name: 'x', method: 'head' }));
+  assert.doesNotThrow(() => buildAddPayload({ url: 'https://a.test/', name: 'x', method: 'head' }));
   process.env.KUMA_MCP_ALLOW_WRITE_METHODS = '1';
   try {
-    assert.equal(buildAddPayload({ name: 'x', method: 'POST', body: { a: 1 } }).method, 'POST');
+    assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', method: 'POST', body: { a: 1 } }).method, 'POST');
     assert.equal(buildEditPayload(cur, { method: 'POST' }, 5).method, 'POST');
   } finally { delete process.env.KUMA_MCP_ALLOW_WRITE_METHODS; }
   process.env.KUMA_MCP_ALLOW_WRITE_METHODS = 'true'; // only the literal "1" enables
-  try { assert.throws(() => buildAddPayload({ name: 'x', method: 'POST' })); } finally { delete process.env.KUMA_MCP_ALLOW_WRITE_METHODS; }
+  try { assert.throws(() => buildAddPayload({ url: 'https://a.test/', name: 'x', method: 'POST' })); } finally { delete process.env.KUMA_MCP_ALLOW_WRITE_METHODS; }
 });
 
 test('F1 target denylist: loopback, link-local, metadata, gateway names and obfuscated forms are refused', () => {
@@ -131,7 +131,7 @@ test('F2 editMonitor of a push monitor with no token is refused and nothing is s
 // ── F6 ──────────────────────────────────────────────────────────────────────
 test('F6 empty accepted_statuscodes is rejected on add and edit', () => {
   for (const v of [[], '', ' , ', ['', ' ']]) {
-    assert.throws(() => buildAddPayload({ name: 'x', accepted_statuscodes: v as any }), /at least one/);
+    assert.throws(() => buildAddPayload({ url: 'https://a.test/', name: 'x', accepted_statuscodes: v as any }), /at least one/);
     assert.throws(() => buildEditPayload(cur, { accepted_statuscodes: v as any }, 5), /at least one/);
   }
   assert.deepEqual(buildEditPayload(cur, {}, 5).accepted_statuscodes, ['200-299']);
@@ -144,7 +144,7 @@ test('a timed-out write is rejected once and never re-emitted (only a not-logged
   client.cfg = { name: 't' };
   client.ensureConnected = async () => {};
   client.emitWithAck = async () => { calls++; throw new Error('[t] timeout waiting for add response'); };
-  await assert.rejects(() => client.addMonitor({ name: 'x' }), /timeout/);
+  await assert.rejects(() => client.addMonitor({ name: 'x', url: 'https://203.0.113.9/' }), /timeout/);
   assert.equal(calls, 1);
 });
 
@@ -245,22 +245,22 @@ test('B1 existing POST/body monitor: a url-only (or host/port/type/headers) edit
 });
 
 test('N1/H2 maxredirects: forced to 0 on add and on edit when target/redirects change, even with write methods; KUMA_MCP_ALLOW_REDIRECTS=1 caps at 2', () => {
-  assert.equal(buildAddPayload({ name: 'x' }).maxredirects, 0);
-  assert.equal(buildAddPayload({ name: 'x', maxredirects: 10 }).maxredirects, 0);
-  assert.equal(buildAddPayload({ name: 'x', maxredirects: 1 }).maxredirects, 0);
+  assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x' }).maxredirects, 0);
+  assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', maxredirects: 10 }).maxredirects, 0);
+  assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', maxredirects: 1 }).maxredirects, 0);
   const c = { ...cur, maxredirects: 10 };
   assert.equal(buildEditPayload(c, { url: 'https://o.example.test/' }, 5).maxredirects, 0);
   assert.equal(buildEditPayload(c, { maxredirects: 9 }, 5).maxredirects, 0);
   assert.equal(buildEditPayload(c, { name: 'n' }, 5).maxredirects, 10); // untouched when nothing request-shaping changed
   process.env.KUMA_MCP_ALLOW_WRITE_METHODS = '1';
   try {
-    assert.equal(buildAddPayload({ name: 'x', maxredirects: 10 }).maxredirects, 0);
+    assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', maxredirects: 10 }).maxredirects, 0);
     assert.equal(buildEditPayload(c, { maxredirects: 9 }, 5).maxredirects, 0);
   } finally { delete process.env.KUMA_MCP_ALLOW_WRITE_METHODS; }
   process.env.KUMA_MCP_ALLOW_REDIRECTS = '1';
   try {
-    assert.equal(buildAddPayload({ name: 'x', maxredirects: 10 }).maxredirects, 2);
-    assert.equal(buildAddPayload({ name: 'x', maxredirects: 1 }).maxredirects, 1);
+    assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', maxredirects: 10 }).maxredirects, 2);
+    assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', maxredirects: 1 }).maxredirects, 1);
     assert.equal(buildEditPayload(c, { maxredirects: 9 }, 5).maxredirects, 2);
   } finally { delete process.env.KUMA_MCP_ALLOW_REDIRECTS; }
 });
