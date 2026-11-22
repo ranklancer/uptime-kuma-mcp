@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+process.env.KUMA_MCP_NOTIFICATION_TYPES = 'ntfy,pushover,pushbullet';
+process.env.KUMA_MCP_NOTIFICATION_HOSTS = '203.0.113.9,203.0.113.9:80,203.0.113.9:25,203.0.113.9:587,ntfy.example.test,ok.example,evil.example,nx.example,x.example,other.example,*.example.com,ntfy.test,n.test,h.test'; // tests of the host list itself override this
+process.env.KUMA_MCP_ALLOW_HOSTS = '*.test,*.example,*.lan,*.local,*.internal,*.example.com'; // these tests use fictional names the system resolver cannot see
 import {
   scrubUrl, redactMonitor, redactNotification, redactHeartbeatAck, sanitizeHeartbeatMsg,
   assertMonitorEditAllowed, assertNotificationEditAllowed, MONITOR_DESTINATION_FIELDS,
@@ -189,8 +192,8 @@ test('L2 failed add/delete/pause/resume/save errors do not echo Kuma msg', async
   client.cfg = { name: 't' };
   client.ensureConnected = async () => {};
   client.emitWithAck = async () => ({ ok: false, msg: 'bad "X-Api-Key: ' + C + '" is not valid JSON' });
-  for (const call of [() => client.addMonitor({ name: 'x' }), () => client.deleteMonitor(1), () => client.pauseMonitor(1),
-    () => client.resumeMonitor(1), () => client.saveNotification({ name: 'x' }), () => client.deleteNotification(1)]) {
+  for (const call of [() => client.addMonitor({ name: 'x', url: 'https://a.test/' }), () => client.deleteMonitor(1), () => client.pauseMonitor(1),
+    () => client.resumeMonitor(1), () => client.saveNotification({ name: 'x', type: 'ntfy', ntfyserverurl: 'https://203.0.113.9' }), () => client.deleteNotification(1)]) {
     await assert.rejects(call, (e: any) => { assert.ok(!e.message.includes(C)); assert.ok(e.message.includes(WITHHELD)); return true; });
   }
   client.emitWithAck = async () => ({ ok: false, msg: 'x ' + C, msgi18n: 'invalidJSON' });

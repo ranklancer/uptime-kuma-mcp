@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+process.env.KUMA_MCP_ALLOW_HOSTS = '*.test,*.example,*.lan,*.local,*.internal,*.example.com'; // these tests use fictional names the system resolver cannot see
 import { EventEmitter } from 'node:events';
 import { UptimeKumaClient, isNotLoggedIn } from '../src/uptime-kuma-client.js';
 import { buildAddPayload, buildEditPayload, genPushToken, fingerprint, deriveTimeout, normalizeStatusCodes } from '../src/payload.js';
@@ -138,7 +139,7 @@ test('add payload carries every NOT NULL default the UI sends', () => {
 });
 
 test('add payload: undefined/null never override NOT NULL defaults; nullable columns may be null', () => {
-  const p = buildAddPayload({ name: 'x', conditions: undefined, maxretries: null, interval: undefined, method: null, parent: null, docker_host: null });
+  const p = buildAddPayload({ url: 'https://a.test/', name: 'x', conditions: undefined, maxretries: null, interval: undefined, method: null, parent: null, docker_host: null });
   assert.deepEqual(p.conditions, []);
   assert.equal(p.maxretries, 0);
   assert.equal(p.interval, 60);
@@ -148,23 +149,23 @@ test('add payload: undefined/null never override NOT NULL defaults; nullable col
 });
 
 test('add payload: timeout derives from interval, explicit timeout wins, ping defaults to 10', () => {
-  assert.equal(buildAddPayload({ name: 'x', interval: 30 }).timeout, 24);
-  assert.equal(buildAddPayload({ name: 'x', interval: 30, timeout: 5 }).timeout, 5);
+  assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', interval: 30 }).timeout, 24);
+  assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', interval: 30, timeout: 5 }).timeout, 5);
   assert.equal(buildAddPayload({ name: 'x', type: 'ping', hostname: 'h' }).timeout, 10);
   assert.equal(deriveTimeout('http', 0), 48);
 });
 
 test('add payload: accepted_statuscodes accepts array and comma string; always string array', () => {
-  assert.deepEqual(buildAddPayload({ name: 'x', accepted_statuscodes: ['200-299', '301'] }).accepted_statuscodes, ['200-299', '301']);
-  assert.deepEqual(buildAddPayload({ name: 'x', accepted_statuscodes: '200-299, 404' }).accepted_statuscodes, ['200-299', '404']);
-  assert.deepEqual(buildAddPayload({ name: 'x', accepted_statuscodes: [200, 301] as any }).accepted_statuscodes, ['200', '301']);
-  assert.throws(() => buildAddPayload({ name: 'x', accepted_statuscodes: [] }), /at least one/);
-  assert.throws(() => buildAddPayload({ name: 'x', accepted_statuscodes: ' , ' }), /at least one/);
+  assert.deepEqual(buildAddPayload({ url: 'https://a.test/', name: 'x', accepted_statuscodes: ['200-299', '301'] }).accepted_statuscodes, ['200-299', '301']);
+  assert.deepEqual(buildAddPayload({ url: 'https://a.test/', name: 'x', accepted_statuscodes: '200-299, 404' }).accepted_statuscodes, ['200-299', '404']);
+  assert.deepEqual(buildAddPayload({ url: 'https://a.test/', name: 'x', accepted_statuscodes: [200, 301] as any }).accepted_statuscodes, ['200', '301']);
+  assert.throws(() => buildAddPayload({ url: 'https://a.test/', name: 'x', accepted_statuscodes: [] }), /at least one/);
+  assert.throws(() => buildAddPayload({ url: 'https://a.test/', name: 'x', accepted_statuscodes: ' , ' }), /at least one/);
   assert.equal(normalizeStatusCodes(undefined), undefined);
 });
 
 test('add payload: headers/body objects become JSON strings; auth + docker + parent pass through', () => {
-  const p = buildAddPayload({ name: 'x', headers: { A: 'b' }, authMethod: 'basic', basic_auth_user: 'u', docker_host: 2, docker_container: 'c', parent: 7 });
+  const p = buildAddPayload({ url: 'https://a.test/', name: 'x', headers: { A: 'b' }, authMethod: 'basic', basic_auth_user: 'u', docker_host: 2, docker_container: 'c', parent: 7 });
   assert.equal(p.headers, '{"A":"b"}');
   assert.equal(p.authMethod, 'basic');
   assert.equal(p.docker_host, 2);
@@ -175,7 +176,7 @@ test('push token: generated 32-char alphanumeric for type=push, not for others',
   const p = buildAddPayload({ name: 'x', type: 'push' });
   assert.match(p.pushToken, /^[A-Za-z0-9]{32}$/);
   assert.notEqual(genPushToken(), genPushToken());
-  assert.equal(buildAddPayload({ name: 'x', type: 'http' }).pushToken, undefined);
+  assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', type: 'http' }).pushToken, undefined);
 });
 
 function addClient(res: any = { ok: true, msg: 'Added Successfully.', monitorID: 9 }) {
@@ -203,7 +204,7 @@ test('addMonitor: sent payload is complete and failure text is withheld', async 
   await client.addMonitor({ name: 'x', url: 'https://a.test/' });
   assert.deepEqual(sent[0][1].conditions, []);
   const bad = addClient({ ok: false, msg: 'NOT NULL constraint failed: monitor.conditions' });
-  await assert.rejects(() => bad.client.addMonitor({ name: 'x' }), (e: any) => !e.message.includes('monitor.conditions'));
+  await assert.rejects(() => bad.client.addMonitor({ name: 'x', url: 'https://a.test/' }), (e: any) => !e.message.includes('monitor.conditions'));
 });
 
 // ── 3. edit merge ───────────────────────────────────────────────────────────

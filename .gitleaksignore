@@ -1,0 +1,4 @@
+# Confirmed false positives only, one fingerprint per line (see .gitleaks.toml policy).
+# test/ssrf-review.test.ts:69 at 9a3afd6: synthetic 15-char ServerChan send-key fixture in a
+# unit test asserting the key is not treated as a host. Not a real key; nothing to rotate.
+9a3afd69753ef74258060f75538e883a0eb71757:test/ssrf-review.test.ts:generic-api-key:69

@@ -148,6 +148,6 @@ test('client.editMonitor merges RAW secrets upstream (no marker written back) an
 
 test('client.addMonitor ack is redacted', async () => {
   const { client } = fakeClient();
-  const res = await client.addMonitor({ name: 'x' });
+  const res = await client.addMonitor({ name: 'x', url: 'https://203.0.113.9/' });
   assert.ok(!JSON.stringify(res).includes('CANARY_'));
 });

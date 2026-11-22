@@ -31,18 +31,18 @@ test('F1 schema: method is GET/HEAD only by default', () => {
 });
 
 test('F1 payload builders refuse write methods and any body unless the operator opts in', () => {
-  assert.throws(() => buildAddPayload({ name: 'x', method: 'POST' }), /method not allowed/);
-  assert.throws(() => buildAddPayload({ name: 'x', body: { a: 1 } }), /body not allowed/);
+  assert.throws(() => buildAddPayload({ url: 'https://a.test/', name: 'x', method: 'POST' }), /method not allowed/);
+  assert.throws(() => buildAddPayload({ url: 'https://a.test/', name: 'x', body: { a: 1 } }), /body not allowed/);
   assert.throws(() => buildEditPayload(cur, { method: 'POST' }, 5), /method not allowed/);
   assert.throws(() => buildEditPayload(cur, { body: 'x' }, 5), /body not allowed/);
-  assert.doesNotThrow(() => buildAddPayload({ name: 'x', method: 'head' }));
+  assert.doesNotThrow(() => buildAddPayload({ url: 'https://a.test/', name: 'x', method: 'head' }));
   process.env.KUMA_MCP_ALLOW_WRITE_METHODS = '1';
   try {
-    assert.equal(buildAddPayload({ name: 'x', method: 'POST', body: { a: 1 } }).method, 'POST');
+    assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', method: 'POST', body: { a: 1 } }).method, 'POST');
     assert.equal(buildEditPayload(cur, { method: 'POST' }, 5).method, 'POST');
   } finally { delete process.env.KUMA_MCP_ALLOW_WRITE_METHODS; }
   process.env.KUMA_MCP_ALLOW_WRITE_METHODS = 'true'; // only the literal "1" enables
-  try { assert.throws(() => buildAddPayload({ name: 'x', method: 'POST' })); } finally { delete process.env.KUMA_MCP_ALLOW_WRITE_METHODS; }
+  try { assert.throws(() => buildAddPayload({ url: 'https://a.test/', name: 'x', method: 'POST' })); } finally { delete process.env.KUMA_MCP_ALLOW_WRITE_METHODS; }
 });
 
 test('F1 target denylist: loopback, link-local, metadata, gateway names and obfuscated forms are refused', () => {
@@ -131,7 +131,7 @@ test('F2 editMonitor of a push monitor with no token is refused and nothing is s
 // ── F6 ──────────────────────────────────────────────────────────────────────
 test('F6 empty accepted_statuscodes is rejected on add and edit', () => {
   for (const v of [[], '', ' , ', ['', ' ']]) {
-    assert.throws(() => buildAddPayload({ name: 'x', accepted_statuscodes: v as any }), /at least one/);
+    assert.throws(() => buildAddPayload({ url: 'https://a.test/', name: 'x', accepted_statuscodes: v as any }), /at least one/);
     assert.throws(() => buildEditPayload(cur, { accepted_statuscodes: v as any }, 5), /at least one/);
   }
   assert.deepEqual(buildEditPayload(cur, {}, 5).accepted_statuscodes, ['200-299']);
@@ -144,7 +144,7 @@ test('a timed-out write is rejected once and never re-emitted (only a not-logged
   client.cfg = { name: 't' };
   client.ensureConnected = async () => {};
   client.emitWithAck = async () => { calls++; throw new Error('[t] timeout waiting for add response'); };
-  await assert.rejects(() => client.addMonitor({ name: 'x' }), /timeout/);
+  await assert.rejects(() => client.addMonitor({ name: 'x', url: 'https://203.0.113.9/' }), /timeout/);
   assert.equal(calls, 1);
 });
 
@@ -220,10 +220,12 @@ test('F4 add_maintenance manual window needs confirmOpenEnded when large or with
   const c: any = (await import('../src/instances.js')).getClient('kuma');
   let added = 0;
   c.addMaintenance = async () => { added++; return { ok: true }; };
-  await am.handler(am.schema.parse({ ...base, monitorIds: [1], dateRange: [null, '2030-01-01 00:00:00'] }));
+  await assert.rejects(() => am.handler(am.schema.parse({ ...base, monitorIds: [1], dateRange: [null, '2030-01-01 00:00:00'] })), /confirmOpenEnded/); // R4: manual always needs confirm
   await am.handler(am.schema.parse({ ...base, monitorIds: [1, 2, 3, 4, 5, 6], confirmOpenEnded: true }));
-  await am.handler(am.schema.parse({ title: 'c', strategy: 'cron', cron: '0 3 * * *', monitorIds: [1, 2, 3, 4, 5, 6, 7] })); // non-manual unaffected
-  assert.equal(added, 3);
+  await am.handler(am.schema.parse({ ...base, monitorIds: [1], confirmOpenEnded: true }));
+  await assert.rejects(() => am.handler(am.schema.parse({ title: 'c', strategy: 'cron', cron: '0 3 * * *', monitorIds: [1, 2, 3, 4, 5, 6, 7] })), /confirmOpenEnded/); // M3: every strategy is gated
+  await am.handler(am.schema.parse({ title: 'c', strategy: 'cron', cron: '0 3 * * *', monitorIds: [1, 2] })); // small, bounded: no confirm
+  assert.equal(added, 3); // confirmed manual x2 + small bounded cron
 });
 
 // ── Round 2: B1, N1-N5 ──────────────────────────────────────────────────────
@@ -242,16 +244,25 @@ test('B1 existing POST/body monitor: a url-only (or host/port/type/headers) edit
   try { assert.doesNotThrow(() => buildEditPayload(post, { url: 'https://other.example.test/' }, 5)); } finally { delete process.env.KUMA_MCP_ALLOW_WRITE_METHODS; }
 });
 
-test('N1 maxredirects: default 0 and capped at 2 on add; capped on edit when target/redirects change; opt-in restores', () => {
-  assert.equal(buildAddPayload({ name: 'x' }).maxredirects, 0);
-  assert.equal(buildAddPayload({ name: 'x', maxredirects: 10 }).maxredirects, 2);
-  assert.equal(buildAddPayload({ name: 'x', maxredirects: 1 }).maxredirects, 1);
+test('N1/H2 maxredirects: forced to 0 on add and on edit when target/redirects change, even with write methods; KUMA_MCP_ALLOW_REDIRECTS=1 caps at 2', () => {
+  assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x' }).maxredirects, 0);
+  assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', maxredirects: 10 }).maxredirects, 0);
+  assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', maxredirects: 1 }).maxredirects, 0);
   const c = { ...cur, maxredirects: 10 };
-  assert.equal(buildEditPayload(c, { url: 'https://o.example.test/' }, 5).maxredirects, 2);
-  assert.equal(buildEditPayload(c, { maxredirects: 9 }, 5).maxredirects, 2);
+  assert.equal(buildEditPayload(c, { url: 'https://o.example.test/' }, 5).maxredirects, 0);
+  assert.equal(buildEditPayload(c, { maxredirects: 9 }, 5).maxredirects, 0);
   assert.equal(buildEditPayload(c, { name: 'n' }, 5).maxredirects, 10); // untouched when nothing request-shaping changed
   process.env.KUMA_MCP_ALLOW_WRITE_METHODS = '1';
-  try { assert.equal(buildAddPayload({ name: 'x', maxredirects: 10 }).maxredirects, 10); } finally { delete process.env.KUMA_MCP_ALLOW_WRITE_METHODS; }
+  try {
+    assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', maxredirects: 10 }).maxredirects, 0);
+    assert.equal(buildEditPayload(c, { maxredirects: 9 }, 5).maxredirects, 0);
+  } finally { delete process.env.KUMA_MCP_ALLOW_WRITE_METHODS; }
+  process.env.KUMA_MCP_ALLOW_REDIRECTS = '1';
+  try {
+    assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', maxredirects: 10 }).maxredirects, 2);
+    assert.equal(buildAddPayload({ url: 'https://a.test/', name: 'x', maxredirects: 1 }).maxredirects, 1);
+    assert.equal(buildEditPayload(c, { maxredirects: 9 }, 5).maxredirects, 2);
+  } finally { delete process.env.KUMA_MCP_ALLOW_REDIRECTS; }
 });
 
 test('N2 built-in denylist covers IPv6 link-local/ULA, IPv4-compatible, NAT64 and 0.0.0.0/8', () => {
@@ -337,15 +348,16 @@ test('R3-4 auth and TLS changes count as request-shaping for the merged-monitor 
 
 test('R3-5 a clamped maxredirects on edit is reported in notes', () => {
   const r = buildEditPayloadWithNotes({ ...cur, maxredirects: 10 }, { url: 'https://o.example.test/' }, 5);
-  assert.equal(r.payload.maxredirects, 2);
-  assert.match(r.notes.join(' '), /maxredirects was reduced from 10 to 2/);
-  assert.deepEqual(buildEditPayloadWithNotes({ ...cur, maxredirects: 1 }, { url: 'https://o.example.test/' }, 5).notes, []);
+  assert.equal(r.payload.maxredirects, 0);
+  assert.match(r.notes.join(' '), /maxredirects was reduced from 10 to 0/);
+  assert.deepEqual(buildEditPayloadWithNotes({ ...cur, maxredirects: 0 }, { url: 'https://o.example.test/' }, 5).notes, []);
 });
 
 test('R3-5b editMonitor surfaces the notes in its response', async () => {
   const client: any = Object.create(UptimeKumaClient.prototype);
   client.cfg = { name: 't' };
   client.ensureConnected = async () => {};
+  process.env.KUMA_MCP_ALLOW_HOSTS = '*.test,*.example,*.lan,*.local,*.internal,*.example.com';
   client.emitWithAck = async (ev: string) => ev === 'getMonitor' ? { ok: true, monitor: { ...cur, maxredirects: 10 } } : { ok: true, msg: 'ok', monitorID: 5 };
   const out = await client.editMonitor(5, { url: 'https://o.example.test/' });
   assert.match(out.notes[0], /maxredirects was reduced/);

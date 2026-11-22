@@ -1,7 +1,7 @@
 import { io, Socket } from 'socket.io-client';
 import type { KumaInstanceConfig, KumaSession, MonitorOpts } from './types.js';
 import { buildAddPayload, buildEditPayloadWithNotes, fingerprint } from './payload.js';
-import { assertResolvedTargetAllowed, effectiveTarget } from './policy.js';
+import { assertResolvedTargetAllowed, assertNotificationConfigAllowed, effectiveTarget } from './policy.js';
 import {
   redactMonitorAck, redactHeartbeatAck, redactNotification, safeFailureText,
   assertMonitorEditAllowed, assertNotificationEditAllowed,
@@ -408,7 +408,10 @@ export class UptimeKumaClient {
   async getHeartbeats(monitorId: number, periodHours = 24): Promise<any> {
     await this.ensureConnected();
     const res = await this.request('getMonitorBeats', monitorId, periodHours);
-    return redactHeartbeatAck(res);
+    // Some monitor types put data they received (MQTT payload, gRPC response, DB result) in msg: withhold it for those.
+    let type: string | undefined;
+    try { type = (await this.getMonitorRaw(monitorId))?.monitor?.type; } catch { type = 'unknown-fail-closed'; }
+    return redactHeartbeatAck(res, type === 'unknown-fail-closed' ? 'mqtt' : type);
   }
 
   /**
@@ -567,6 +570,8 @@ export class UptimeKumaClient {
     notificationID: number | null = null,
   ): Promise<any> {
     await this.ensureConnected();
+    // Create: the whole object is caller input. (Update checks only the incoming changes: see updateNotification.)
+    if (notificationID === null) await assertNotificationConfigAllowed(notification);
     const res = await this.request('addNotification', notification, notificationID ?? null);
     if (!res?.ok) {
       throw new Error(`[${this.cfg.name}] save notification failed: ${safeFailureText(res)}`);
@@ -592,15 +597,19 @@ export class UptimeKumaClient {
     else if (typeof rawConfig === 'string') {
       try { currentConfig = JSON.parse(rawConfig); } catch { currentConfig = {}; }
     }
+    // config first: the explicit top-level fields (which the tool layer gates) must win over anything inside `config`.
     const changes: Record<string, unknown> = {
+      ...(args.config ?? {}),
       ...(args.name !== undefined ? { name: args.name } : {}),
       ...(args.type !== undefined ? { type: args.type } : {}),
       ...(args.isDefault !== undefined ? { isDefault: args.isDefault } : {}),
       ...(args.applyExisting !== undefined ? { applyExisting: args.applyExisting } : {}),
-      ...(args.config ?? {}),
     };
     assertNotificationEditAllowed(currentConfig, changes);
     const merged: Record<string, any> = { ...currentConfig, ...changes };
+    if (merged.type === undefined) merged.type = (existing as any).type;
+    // The EFFECTIVE config is policed (stored fields included), not only the incoming changes.
+    await assertNotificationConfigAllowed(merged);
     // Kuma requires name and type to be present on save.
     if (merged.name === undefined) merged.name = (existing as any).name;
     return this.saveNotification(merged, notificationId);

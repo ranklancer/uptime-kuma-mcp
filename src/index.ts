@@ -5,7 +5,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { toolDefs } from './tools.js';
-import { invalidDenyEntries } from './policy.js';
+import { invalidDenyEntries, invalidAllowEntries, invalidNotificationHostEntries, wildcardProblems } from './policy.js';
 import { disconnectAll } from './instances.js';
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
@@ -137,9 +137,22 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 {
+  const wild = wildcardProblems();
+  if (wild.length > 0) {
+    for (const w of wild) console.error(`FATAL: ${w.env} entry "${w.entry}" is a ${w.reason}; list the specific hosts or a *.your-own-domain suffix instead`);
+    process.exit(1);
+  }
   const bad = invalidDenyEntries();
   if (bad.length > 0) {
     console.error(`WARNING: KUMA_MCP_DENY_HOSTS has invalid entries (monitor add/edit will fail until fixed): ${bad.join(', ')}`);
+  }
+  const badNotif = invalidNotificationHostEntries();
+  if (badNotif.length > 0) {
+    console.error(`WARNING: KUMA_MCP_NOTIFICATION_HOSTS has invalid entries (ignored, so those destinations are refused; only an exact host, *.suffix or [ipv6], with an optional :port, is accepted): ${badNotif.join(', ')}`);
+  }
+  const badAllow = invalidAllowEntries();
+  if (badAllow.length > 0) {
+    console.error(`WARNING: KUMA_MCP_ALLOW_HOSTS has invalid entries (ignored, so those hosts stay unverified and are refused): ${badAllow.join(', ')}`);
   }
 }
 
