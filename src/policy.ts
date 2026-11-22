@@ -203,8 +203,14 @@ export function effectiveTarget(m: Record<string, any>): Target {
   if (NO_TARGET_TYPES.includes(t)) return {};
   // A type change can activate a stale grpcUrl / databaseConnectionString left from an earlier type.
   if (t === 'grpc') return { hostPort: typeof m.grpcUrl === 'string' && m.grpcUrl.trim() ? m.grpcUrl.trim() : undefined };
-  if (DB_TYPES.includes(t)) return { hostPort: dbTargetOf(m.databaseConnectionString) };
+  if (DB_TYPES.includes(t)) {
+    const hp = dbTargetOf(m.databaseConnectionString);
+    if (hp === undefined) throw new Error('monitor target not allowed: a database monitor needs an explicit connection string (without one the driver connects to localhost)');
+    return { hostPort: hp };
+  }
   const unknown = !URL_TYPES.includes(t) && !HOST_TYPES.includes(t);
+  // A host-type monitor with no hostname is connected to localhost by the client libraries (tcp-ping, dgram, mqtt): refuse.
+  if (HOST_TYPES.includes(t) && (typeof m.hostname !== 'string' || m.hostname === '')) throw new Error('monitor target not allowed: this monitor type needs an explicit hostname');
   // An http-type monitor with no real url would be sent by Kuma to localhost: that is a target, and it is refused.
   if (URL_TYPES.includes(t) && isPlaceholderUrl(m.url)) throw new Error('monitor target not allowed: this monitor type needs an explicit http(s):// url');
   return {

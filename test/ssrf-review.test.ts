@@ -732,3 +732,13 @@ test('R14-B1 an http-type monitor without a real url (empty/placeholder/padded) 
   buildAddPayload({ type: 'ping', name: 'x', hostname: 'a.example' });
   buildAddPayload({ type: 'http', name: 'x', url: 'https://a.example/' });
 });
+
+test('R14-C1 a host-type monitor with no/empty hostname (and a DB monitor with no connection string) is refused: client libraries connect to localhost', () => {
+  for (const type of ['port', 'radius', 'mqtt', 'dns', 'ping', 'smtp', 'snmp'])
+    for (const h of [undefined, ''])
+      assert.throws(() => buildAddPayload({ type, name: 'x', ...(h === undefined ? {} : { hostname: h }), port: 2375 }), /not allowed/, `${type}:${JSON.stringify(h)}`);
+  assert.throws(() => effectiveTarget({ type: 'redis' }), /connection string/);
+  assert.throws(() => effectiveTarget({ type: 'postgres', databaseConnectionString: '' }), /connection string/);
+  assert.throws(() => buildEditPayload({ id: 1, type: 'port', name: 'x', hostname: 'a.example', port: 80 } as any, { hostname: '' } as any, 1), /not allowed/);
+  buildAddPayload({ type: 'port', name: 'x', hostname: 'a.example', port: 80 });
+});
