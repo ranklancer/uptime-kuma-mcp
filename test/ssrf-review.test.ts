@@ -715,3 +715,10 @@ test('R13-B2 a :port written after / ? # in a scheme-less target is path text, n
   });
   await withEnv({ KUMA_MCP_DENY_HOSTS: '192.168.1.54:5700' }, async () => { assert.throws(() => assertTargetAllowed({ hostPort: '192.168.1.54:5700' }), /not allowed/); assertTargetAllowed({ hostPort: '192.168.1.54/:5700' }); });
 });
+
+test('R14-A1 a monitor target padded with Unicode whitespace is refused (JS trim() strips U+3000, legacy url.parse does not -> localhost:80)', () => {
+  for (const u of ['　https://example.com/', 'https://example.com/　', ' http://a.example/', ' https://a.example/', ' https://a.example/', ' https://a.example/', 'https://a.example/​'])
+    assert.throws(() => assertTargetAllowed({ url: u }), /whitespace|not allowed/, JSON.stringify(u));
+  assert.throws(() => assertTargetAllowed({ hostname: ' a.example' }), /not allowed|whitespace/);
+  assertTargetAllowed({ url: 'https://a.example/' });
+});

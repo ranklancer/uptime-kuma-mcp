@@ -355,6 +355,8 @@ export function assertTargetAllowed(t: Target, opts: { exemptPrivate?: boolean }
   const port = t.port !== undefined && t.port !== null ? String(t.port) : '';
   for (const [field, raw] of [['url', t.url], ['hostname', t.hostname], ['hostPort', t.hostPort], ['dns', t.dns_resolve_server]] as const) {
     if (typeof raw !== 'string' || raw === '') continue;
+    // Legacy url.parse strips only ASCII whitespace/NBSP/BOM; JS trim() also strips U+3000 etc., so a padded value is checked as one host and connected as another (localhost:80). Refuse padding and hidden characters outright.
+    if (raw !== raw.trim() || HIDDEN_TEST.test(raw)) throw new Error('monitor target not allowed: whitespace or control characters in target');
     if (field === 'hostname' || field === 'dns') assertBareHost(raw);
     // A monitor `url` must carry an explicit http/https/ws/wss scheme (no scheme-less or relative forms).
     if (field === 'url' && !/^(https?|wss?):\/\//i.test(raw.trim())) {
